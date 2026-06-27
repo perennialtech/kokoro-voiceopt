@@ -14,7 +14,6 @@ assets:
   prepared_corpus_dir: runs/my_speaker/corpus
   voice_names: null
   include_cross_language_voices: true
-  require_consistent_shape: true
   dtype: float32
 
 audio:

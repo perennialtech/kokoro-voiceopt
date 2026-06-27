@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 from pathlib import Path
+from typing import Any
 
 import torch
 from huggingface_hub import hf_hub_download
 from tqdm import tqdm
 
-from .config import hash_file
+from .serde import fingerprint, load_pt, sha256_file, sha256_tensor
+from .voice import as_voice_2d
 
 DEFAULT_VOICE_NAMES = [
     "af_alloy",
@@ -70,30 +71,6 @@ def resolve_voice_names(config, lang_code: str) -> list[str]:
     return names
 
 
-def canonicalize_voice_tensor(t: torch.Tensor) -> torch.Tensor:
-    if not isinstance(t, torch.Tensor):
-        raise TypeError(f"Expected torch.Tensor, got {type(t)!r}")
-
-    if t.ndim == 3:
-        if t.shape[1] != 1:
-            raise ValueError(
-                f"Expected middle dimension 1 for [T,1,256], got {tuple(t.shape)}"
-            )
-        t = t[:, 0, :]
-    elif t.ndim != 2:
-        raise ValueError(f"Expected [T,1,256] or [T,256], got {tuple(t.shape)}")
-
-    if t.shape[-1] != 256:
-        raise ValueError(f"Expected D=256, got {tuple(t.shape)}")
-
-    return t.contiguous()
-
-
-def hash_tensor(t: torch.Tensor) -> str:
-    array = t.detach().cpu().contiguous().numpy()
-    return hashlib.sha256(array.tobytes()).hexdigest()
-
-
 def dtype_from_name(name: str) -> torch.dtype:
     if name == "float32":
         return torch.float32
@@ -116,98 +93,106 @@ def find_local_voice(voices_dir: Path | None, name: str) -> Path | None:
     return None
 
 
-def torch_load_voice(path: Path) -> torch.Tensor:
+def load_voice_tensor(path: Path) -> torch.Tensor:
     try:
-        return torch.load(path, map_location="cpu", weights_only=True)
+        return load_pt(path, weights_only=True)
     except TypeError:
-        return torch.load(path, map_location="cpu")
+        return load_pt(path)
 
 
-def prepare_voice_corpus(run, force: bool = False) -> dict:
-    corpus_dir = run.corpus_dir
+def corpus_fingerprint(ctx) -> dict[str, Any]:
+    return {
+        "repo_id": ctx.assets.repo_id,
+        "selected_voice_names": resolve_voice_names(ctx.assets, ctx.target.lang_code),
+        "include_cross_language_voices": ctx.assets.include_cross_language_voices,
+        "dtype": ctx.assets.dtype,
+        "asset_config_sha256": fingerprint(ctx.assets),
+    }
+
+
+def corpus_artifact(ctx):
+    return ctx.artifacts.spec(
+        "voice_corpus",
+        data=ctx.paths.corpus("corpus.pt"),
+        meta=ctx.paths.corpus("corpus_manifest.json"),
+        fingerprint=corpus_fingerprint(ctx),
+    )
+
+
+def prepare_voice_corpus(ctx, force: bool = False) -> dict:
+    corpus_dir = ctx.paths.corpus_dir
     if corpus_dir.exists() and any(corpus_dir.iterdir()):
         if not force:
             raise SystemExit(f"{corpus_dir} already exists, use --force to recreate it")
         shutil.rmtree(corpus_dir)
 
-    run.write_resolved_config()
+    ctx.write_resolved_config()
     corpus_dir.mkdir(parents=True, exist_ok=True)
 
-    names = resolve_voice_names(run.assets, run.target.lang_code)
+    names = resolve_voice_names(ctx.assets, ctx.target.lang_code)
     if not names:
         raise ValueError("No voice names selected for the prepared corpus")
 
-    dtype = dtype_from_name(run.assets.dtype)
+    dtype = dtype_from_name(ctx.assets.dtype)
 
     records = []
     tensors = []
 
     for name in tqdm(names, desc="Preparing voice corpus"):
-        path = find_local_voice(run.assets.voices_dir, name)
+        path = find_local_voice(ctx.assets.voices_dir, name)
         if path is None:
             path = Path(
-                hf_hub_download(run.assets.repo_id, filename=f"voices/{name}.pt")
+                hf_hub_download(ctx.assets.repo_id, filename=f"voices/{name}.pt")
             )
 
-        raw = torch_load_voice(path)
-        canonical = canonicalize_voice_tensor(raw).to(dtype=dtype).cpu().contiguous()
+        raw = load_voice_tensor(path)
+        canonical = as_voice_2d(raw).to(dtype=dtype).cpu().contiguous()
 
         records.append(
             {
                 "name": name,
                 "language_prefix": name.split("_", 1)[0],
                 "source_path": str(path),
-                "source_sha256": hash_file(path),
-                "tensor_sha256": hash_tensor(canonical),
+                "source_sha256": sha256_file(path),
+                "tensor_sha256": sha256_tensor(canonical),
                 "shape": list(canonical.shape),
             }
         )
         tensors.append(canonical)
 
+    shapes = {tuple(tensor.shape) for tensor in tensors}
+    if len(shapes) != 1:
+        detail = "\n".join(
+            f"  - {record['name']}: {record['shape']}" for record in records
+        )
+        raise ValueError(f"Selected voices have inconsistent shapes:\n{detail}")
+
     T, D = tensors[0].shape
-    if run.assets.require_consistent_shape:
-        for record, tensor in zip(records, tensors):
-            if tuple(tensor.shape) != (T, D):
-                raise ValueError(
-                    f"Inconsistent voice shape for {record['name']}: "
-                    f"expected {(T, D)}, got {tuple(tensor.shape)}"
-                )
-
     voices = torch.stack(tensors, dim=0).contiguous()
-    corpus_sha256 = hash_tensor(voices)
+    corpus_sha256 = sha256_tensor(voices)
 
-    metadata = {
-        "schema_version": 1,
-        "repo_id": run.assets.repo_id,
+    payload = {
+        "voices": voices,
+        "names": names,
+        "language_prefixes": [record["language_prefix"] for record in records],
+    }
+
+    manifest_extra = {
+        "repo_id": ctx.assets.repo_id,
         "voice_names_config": (
-            list(run.assets.voice_names) if run.assets.voice_names else None
+            list(ctx.assets.voice_names) if ctx.assets.voice_names else None
         ),
         "selected_voice_names": names,
-        "include_cross_language_voices": run.assets.include_cross_language_voices,
-        "require_consistent_shape": run.assets.require_consistent_shape,
-        "dtype": run.assets.dtype,
+        "include_cross_language_voices": ctx.assets.include_cross_language_voices,
+        "dtype": ctx.assets.dtype,
         "num_voices": len(names),
         "T": T,
         "D": D,
         "corpus_sha256": corpus_sha256,
-    }
-
-    torch.save(
-        {
-            "voices": voices,
-            "names": names,
-            "language_prefixes": [r["language_prefix"] for r in records],
-            "metadata": metadata,
-        },
-        run.corpus_pt,
-    )
-
-    manifest = {
-        **metadata,
         "voices": records,
     }
-    with open(run.corpus_manifest, "w", encoding="utf-8") as file:
-        json.dump(manifest, file, indent=2, ensure_ascii=False)
 
-    print(json.dumps(manifest, indent=2, ensure_ascii=False))
-    return manifest
+    metadata = corpus_artifact(ctx).save_pt(payload, extra=manifest_extra)
+
+    print(json.dumps(metadata, indent=2, ensure_ascii=False))
+    return metadata

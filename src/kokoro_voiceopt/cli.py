@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 
-from .config import Run
+from .config import Context
 
 
 def add_config(parser: argparse.ArgumentParser) -> None:
@@ -11,8 +10,8 @@ def add_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--project-root", default=None)
 
 
-def load(args) -> Run:
-    return Run.load(args.config, project_root=args.project_root)
+def load(args) -> Context:
+    return Context.load(args.config, project_root=args.project_root)
 
 
 def main(argv=None) -> None:
@@ -29,9 +28,9 @@ def main(argv=None) -> None:
     def run_assets(args) -> None:
         from .assets import prepare_voice_corpus
 
-        run = load(args)
-        run.write_resolved_config()
-        prepare_voice_corpus(run, force=args.force)
+        ctx = load(args)
+        ctx.write_resolved_config()
+        prepare_voice_corpus(ctx, force=args.force)
 
     assets_cmd.set_defaults(func=run_assets)
 
@@ -44,12 +43,12 @@ def main(argv=None) -> None:
     def run_prepare(args) -> None:
         from .data import prepare_target_dataset
 
-        run = load(args)
-        run.write_resolved_config()
+        ctx = load(args)
+        ctx.write_resolved_config()
         prepare_target_dataset(
-            run,
-            Path(args.audio_dir),
-            Path(args.transcripts),
+            ctx,
+            ctx.resolve_path(args.audio_dir),
+            ctx.resolve_path(args.transcripts),
             force=args.force,
         )
 
@@ -71,12 +70,11 @@ def main(argv=None) -> None:
 
     def run_profile(args) -> None:
         from .profile import build_target_speaker_profile
-        from .speaker import WavLMXVectorSpeakerEncoder
 
-        run = load(args)
-        run.write_resolved_config()
-        speaker = WavLMXVectorSpeakerEncoder(run.speaker_encoder, run.device)
-        build_target_speaker_profile(run, speaker, force=args.force)
+        ctx = load(args)
+        ctx.write_resolved_config()
+        speaker = ctx.services.speaker_encoder()
+        build_target_speaker_profile(ctx, speaker, force=args.force)
 
     profile_cmd.set_defaults(func=run_profile)
 
@@ -96,15 +94,16 @@ def main(argv=None) -> None:
     def run_optimize(args) -> None:
         from .pipeline import VoiceOptimizationPipeline
 
-        run = load(args)
-        run.write_resolved_config()
-        result = VoiceOptimizationPipeline(run).run()
+        ctx = load(args)
+        ctx.write_resolved_config()
+        result = VoiceOptimizationPipeline(ctx).run()
         print(f"Best voice: {result.best_voice_path}")
         print(f"Final voice: {result.final_voice_path}")
         print(f"Best validation loss: {result.best_validation_loss:.6f}")
         print(f"Best optimization loss: {result.best_optimization_loss:.6f}")
         print(f"Selected stage: {result.selected_stage}")
-        print(f"Selected candidate hash: {result.selected_candidate_hash}")
+        print(f"Selected candidate id: {result.selected_candidate_id}")
+        print(f"Selected voice hash: {result.selected_voice_hash}")
 
     optimize_cmd.set_defaults(func=run_optimize)
 
@@ -113,7 +112,7 @@ def main(argv=None) -> None:
     export_cmd.add_argument(
         "--candidate",
         default="best",
-        help="best, final, best_optimization, or an explicit candidate hash",
+        help="best, final, best_optimization, or an explicit voice hash",
     )
     export_cmd.add_argument("--voice-out", default=None)
     export_cmd.add_argument("--meta-out", default=None)
@@ -121,13 +120,13 @@ def main(argv=None) -> None:
     def run_export(args) -> None:
         from .pipeline import export_voice
 
-        run = load(args)
-        run.write_resolved_config()
+        ctx = load(args)
+        ctx.write_resolved_config()
         export_voice(
-            run,
+            ctx,
             candidate=args.candidate,
-            voice_out=Path(args.voice_out) if args.voice_out else None,
-            meta_out=Path(args.meta_out) if args.meta_out else None,
+            voice_out=ctx.resolve_path(args.voice_out) if args.voice_out else None,
+            meta_out=ctx.resolve_path(args.meta_out) if args.meta_out else None,
         )
 
     export_cmd.set_defaults(func=run_export)
@@ -139,9 +138,9 @@ def main(argv=None) -> None:
     def run_preview(args) -> None:
         from .pipeline import preview
 
-        run = load(args)
-        run.write_resolved_config()
-        preview(run, voice_path=Path(args.voice) if args.voice else None)
+        ctx = load(args)
+        ctx.write_resolved_config()
+        preview(ctx, voice_path=ctx.resolve_path(args.voice) if args.voice else None)
 
     preview_cmd.set_defaults(func=run_preview)
 

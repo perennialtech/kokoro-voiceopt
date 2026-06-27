@@ -24,6 +24,8 @@ kokoro-voiceopt export  --config config.yaml --project-root . --candidate best
 kokoro-voiceopt preview --config config.yaml --project-root .
 ```
 
+All relative CLI paths are resolved against `--project-root`.
+
 ## Transcript formats
 
 Preferred JSONL format:
@@ -65,7 +67,7 @@ Use spoken-form transcript text.
 
 ## Run layout
 
-A run is self-describing on disk:
+A run is self-describing on disk. Artifact metadata and cache fingerprints are stored beside artifact data.
 
 ```text
 runs/<id>/
@@ -80,6 +82,7 @@ runs/<id>/
       rejected.jsonl
     report.json
     text_plan.json
+    text_plan.meta.json
 
   profile/
     target_profile.pt
@@ -100,7 +103,15 @@ runs/<id>/
       latent_history.jsonl
       validation.json
     checkpoints/
+      blend_000010_<candidate-id>.pt
+      latent_000020_<candidate-id>.pt
+    voices/
+      <voice_hash>.pt
+    evaluations/
+      <candidate_id>.json
     candidates/
+      <candidate_id>.json
+      <candidate_id>.pt
     run_info.json
 
   export/
@@ -117,6 +128,28 @@ runs/<id>/
     preview_00.wav
     preview_00.json
 ```
+
+## Artifact metadata
+
+Artifacts use a common metadata schema:
+
+```json
+{
+  "schema_version": 1,
+  "artifact": "target_profile",
+  "fingerprint": {
+    "target_manifest_sha256": "...",
+    "audio_config": "...",
+    "speaker_encoder_config": "..."
+  },
+  "data_path": "target_profile.pt",
+  "data_sha256": "...",
+  "created_at": "2026-06-27T00:00:00+00:00",
+  "...": "artifact-specific summary fields"
+}
+```
+
+If an artifact exists but its fingerprint no longer matches the current config/input files, the command raises a stale-artifact error or rebuilds when the stage owns the artifact.
 
 ## Prepared target manifest
 
@@ -163,6 +196,8 @@ Stable reject reasons include:
 - `hard_end`
 - `save_failed`
 
+Hard-end detection runs before fade application, so fades cannot hide abrupt endings. Clips beyond `data.max_target_clips` are selected before WAV writing, so discarded accepted clips do not leave orphan files.
+
 ## Target profile
 
 The profile command reads only prepared manifest rows and canonical WAVs. It does not load raw target audio and does not segment anything.
@@ -184,7 +219,7 @@ Duration loss during optimization uses this speech rate to compute text-length-a
 
 ## Prepared corpus
 
-The `assets` command resolves/downloads Kokoro voicepacks, canonicalizes them to `[T, D]`, validates shape, hashes sources and tensors, and writes:
+The `assets` command resolves/downloads Kokoro voicepacks, canonicalizes them to `[T, D]`, validates that all selected voices have the same shape, hashes sources and tensors, and writes:
 
 ```text
 corpus.pt
@@ -192,6 +227,26 @@ corpus_manifest.json
 ```
 
 Optimization never downloads voicepacks. It loads only the prepared corpus artifact.
+
+## Optimization artifact model
+
+Voice tensor persistence is separated from stage/evaluation records:
+
+- `voice_hash` identifies voice tensor content.
+- `candidate_id` identifies a stage/evaluation record for a voice.
+- The same `voice_hash` can have multiple candidate/evaluation records, for example baseline and validation.
+
+Candidate metadata includes:
+
+- text-plan hash,
+- optimization text hash,
+- validation text hash,
+- objective config hash,
+- search config hash,
+- corpus hash,
+- target profile hash.
+
+Validation explicitly records whether search priors/bounds were included. By default final validation excludes latent prior/bound penalties and evaluates only the validation objective.
 
 ## Export and preview
 
@@ -201,7 +256,7 @@ Export selectors:
 kokoro-voiceopt export --config config.yaml --candidate best
 kokoro-voiceopt export --config config.yaml --candidate final
 kokoro-voiceopt export --config config.yaml --candidate best_optimization
-kokoro-voiceopt export --config config.yaml --candidate <candidate_hash>
+kokoro-voiceopt export --config config.yaml --candidate <voice_hash>
 ```
 
 Preview synthesizes validation texts from `data/text_plan.json` using an exported voice.

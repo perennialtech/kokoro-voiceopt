@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from typing import Any
 
 import torch
 
-from .config import hash_file, stable_hash_json
-from .corpus import VoiceCorpus
+from .serde import fingerprint, sha256_file
+from .voice import as_voice_2d
 
 
 @dataclass
@@ -24,9 +23,7 @@ class VoiceManifold:
     metadata: dict
 
     @classmethod
-    def fit(
-        cls, corpus: VoiceCorpus, config, metadata: dict | None = None
-    ) -> "VoiceManifold":
+    def fit(cls, corpus, config, metadata: dict | None = None) -> "VoiceManifold":
         voices = corpus.tensors().to(torch.float32)
         N, T, D = voices.shape
         flat = voices.reshape(N, T * D).contiguous()
@@ -75,10 +72,7 @@ class VoiceManifold:
         return int(self.components.shape[0])
 
     def encode(self, voice: torch.Tensor) -> torch.Tensor:
-        if voice.ndim == 3:
-            if voice.shape[1] != 1:
-                raise ValueError(f"Expected [T,1,D], got {tuple(voice.shape)}")
-            voice = voice[:, 0, :]
+        voice = as_voice_2d(voice)
         if tuple(voice.shape) != (self.T, self.D):
             raise ValueError(
                 f"Expected voice shape {(self.T, self.D)}, got {tuple(voice.shape)}"
@@ -126,29 +120,23 @@ class VoiceManifold:
         ).clamp_min(0.0)
         return excess.square().mean()
 
-    def save(self, path: str | Path) -> None:
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "center": self.center.cpu().to(torch.float32).contiguous(),
-                "components": self.components.cpu().to(torch.float32).contiguous(),
-                "sigma": self.sigma.cpu().to(torch.float32).contiguous(),
-                "T": self.T,
-                "D": self.D,
-                "voice_names": self.voice_names,
-                "config": asdict(self.config),
-                "explained_variance_ratio": self.explained_variance_ratio.cpu()
-                .to(torch.float32)
-                .contiguous(),
-                "metadata": self.metadata,
-            },
-            path,
-        )
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "center": self.center.cpu().to(torch.float32).contiguous(),
+            "components": self.components.cpu().to(torch.float32).contiguous(),
+            "sigma": self.sigma.cpu().to(torch.float32).contiguous(),
+            "T": self.T,
+            "D": self.D,
+            "voice_names": self.voice_names,
+            "config": asdict(self.config),
+            "explained_variance_ratio": self.explained_variance_ratio.cpu()
+            .to(torch.float32)
+            .contiguous(),
+            "metadata": self.metadata,
+        }
 
     @classmethod
-    def load(cls, path: str | Path, config_type) -> "VoiceManifold":
-        data = torch.load(path, map_location="cpu")
+    def from_payload(cls, data: dict, config_type) -> "VoiceManifold":
         return cls(
             center=data["center"].to(torch.float32).contiguous(),
             components=data["components"].to(torch.float32).contiguous(),
@@ -163,45 +151,52 @@ class VoiceManifold:
             metadata=dict(data.get("metadata", {})),
         )
 
-    def report(self) -> dict:
+    def report(self) -> dict[str, Any]:
         return {
             "T": self.T,
             "D": self.D,
             "latent_dim": self.latent_dim,
             "voice_names": self.voice_names,
-            "config": asdict(self.config),
+            "manifold_config": asdict(self.config),
             "explained_variance_ratio": self.explained_variance_ratio.tolist(),
             "explained_variance_total": float(self.explained_variance_ratio.sum()),
-            "metadata": self.metadata,
+            "build_metadata": self.metadata,
         }
 
 
-def manifold_metadata(run, corpus: VoiceCorpus) -> dict:
+def manifold_fingerprint(ctx, corpus) -> dict[str, Any]:
     return {
-        "schema_version": 1,
-        "corpus_manifest_sha256": hash_file(run.corpus_manifest),
+        "corpus_manifest_sha256": sha256_file(ctx.paths.corpus("corpus_manifest.json")),
         "corpus_sha256": corpus.corpus_sha256,
-        "manifold_config_sha256": stable_hash_json(run.manifold),
+        "manifold_config_sha256": fingerprint(ctx.manifold),
         "voice_names": corpus.names(),
         "T": corpus.T,
         "D": corpus.D,
     }
 
 
-def load_or_build_manifold(run, corpus: VoiceCorpus) -> VoiceManifold:
-    expected = manifold_metadata(run, corpus)
+def manifold_artifact(ctx, corpus):
+    return ctx.artifacts.spec(
+        "voice_manifold",
+        data=ctx.paths.manifold("manifold.pt"),
+        meta=ctx.paths.manifold("manifold_report.json"),
+        fingerprint=manifold_fingerprint(ctx, corpus),
+    )
 
-    if run.paths.manifold_pt.exists():
-        existing = VoiceManifold.load(run.paths.manifold_pt, type(run.manifold))
-        if existing.metadata == expected:
-            return existing
 
-    manifold = VoiceManifold.fit(corpus, run.manifold, metadata=expected)
-    if run.manifold.save_manifold:
-        manifold.save(run.paths.manifold_pt)
+def load_or_build_manifold(ctx, corpus) -> VoiceManifold:
+    artifact = manifold_artifact(ctx, corpus)
 
-    run.paths.manifold_dir.mkdir(parents=True, exist_ok=True)
-    with open(run.paths.manifold_report, "w", encoding="utf-8") as file:
-        json.dump(manifold.report(), file, indent=2, ensure_ascii=False)
+    if (
+        artifact.data_path.exists()
+        and artifact.meta_path.exists()
+        and artifact.is_current()
+    ):
+        return VoiceManifold.from_payload(artifact.load_pt(), type(ctx.manifold))
+
+    manifold = VoiceManifold.fit(corpus, ctx.manifold, metadata=artifact.fingerprint)
+
+    if ctx.manifold.save_manifold:
+        artifact.save_pt(manifold.to_payload(), extra=manifold.report())
 
     return manifold

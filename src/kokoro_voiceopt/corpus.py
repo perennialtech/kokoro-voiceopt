@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
 
-from .assets import hash_tensor, resolve_voice_names
-from .config import hash_file
+from .assets import corpus_artifact, resolve_voice_names
+from .serde import sha256_tensor
 
 
 @dataclass
@@ -28,45 +27,37 @@ class VoiceCorpus:
     corpus_sha256: str
 
     @classmethod
-    def load(cls, run) -> "VoiceCorpus":
-        run.require_corpus()
+    def load(cls, ctx) -> "VoiceCorpus":
+        ctx.require_corpus()
+        artifact = corpus_artifact(ctx)
+        manifest = artifact.require_current()
+        data = artifact.load_pt()
 
-        with open(run.corpus_manifest, encoding="utf-8") as file:
-            manifest = json.load(file)
-
-        data = torch.load(run.corpus_pt, map_location="cpu")
         voices = data["voices"].cpu().contiguous()
         names = list(data["names"])
         prefixes = list(data["language_prefixes"])
 
-        expected_names = resolve_voice_names(run.assets, run.target.lang_code)
+        expected_names = resolve_voice_names(ctx.assets, ctx.target.lang_code)
         errors = []
 
-        if manifest.get("schema_version") != 1:
-            errors.append("unsupported corpus manifest schema_version")
-        if manifest.get("repo_id") != run.assets.repo_id:
-            errors.append("repo_id mismatch")
         if manifest.get("selected_voice_names") != expected_names:
             errors.append("selected voice names mismatch")
+        if manifest.get("repo_id") != ctx.assets.repo_id:
+            errors.append("repo_id mismatch")
         if (
             manifest.get("include_cross_language_voices")
-            != run.assets.include_cross_language_voices
+            != ctx.assets.include_cross_language_voices
         ):
             errors.append("include_cross_language_voices mismatch")
-        if manifest.get("dtype") != run.assets.dtype:
+        if manifest.get("dtype") != ctx.assets.dtype:
             errors.append("dtype mismatch")
         if names != manifest.get("selected_voice_names"):
             errors.append("corpus.pt names do not match manifest")
-        if hash_tensor(voices) != manifest.get("corpus_sha256"):
+        if sha256_tensor(voices) != manifest.get("corpus_sha256"):
             errors.append("corpus tensor hash mismatch")
 
         if voices.ndim != 3 or voices.shape[-1] != 256:
             errors.append(f"invalid corpus tensor shape: {tuple(voices.shape)}")
-
-        if run.assets.require_consistent_shape:
-            shapes = {tuple(v.shape) for v in voices}
-            if len(shapes) != 1:
-                errors.append("corpus tensor shapes are inconsistent")
 
         if errors:
             raise ValueError(
@@ -88,7 +79,7 @@ class VoiceCorpus:
             T=int(voices.shape[1]),
             D=int(voices.shape[2]),
             manifest=manifest,
-            manifest_sha256=hash_file(run.corpus_manifest),
+            manifest_sha256=str(manifest["data_sha256"]),
             corpus_sha256=str(manifest["corpus_sha256"]),
         )
 

@@ -1,13 +1,15 @@
 """Black-box Kokoro voice optimization package."""
 
-from .config import (AudioConfig, DataConfig, ManifoldConfig, ObjectiveConfig,
-                     Run, RunPaths, SearchConfig, SpeakerEncoderConfig,
-                     TargetConfig, TextConfig, VoiceCorpusConfig)
+from .config import (AudioConfig, Context, DataConfig, ManifoldConfig,
+                     ObjectiveConfig, PathLayout, RunConfig, SearchConfig,
+                     SpeakerEncoderConfig, TargetConfig, TextConfig,
+                     VoiceCorpusConfig)
 from .pipeline import VoiceOptimizationPipeline, VoiceOptimizationResult
 
 __all__ = [
-    "Run",
-    "RunPaths",
+    "Context",
+    "PathLayout",
+    "RunConfig",
     "TargetConfig",
     "AudioConfig",
     "DataConfig",

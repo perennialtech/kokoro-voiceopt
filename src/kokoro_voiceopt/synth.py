@@ -2,15 +2,7 @@ from __future__ import annotations
 
 import torch
 
-
-def to_kokoro_voice(t: torch.Tensor) -> torch.Tensor:
-    if t.ndim == 2:
-        t = t.unsqueeze(1)
-
-    if t.ndim != 3 or t.shape[1] != 1 or t.shape[2] != 256:
-        raise ValueError(f"Invalid Kokoro voice shape: {tuple(t.shape)}")
-
-    return t.detach().to(torch.float32).contiguous()
+from .voice import as_kokoro_voice
 
 
 class KokoroSynthesizer:
@@ -35,12 +27,15 @@ class KokoroSynthesizer:
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def synthesize(
-        self, text: str, voice: torch.Tensor, speed: float = 1.0
+        self,
+        text: str,
+        voice: torch.Tensor,
+        speed: float = 1.0,
     ) -> torch.Tensor:
         if not text or not text.strip():
             raise ValueError("Cannot synthesize empty text")
 
-        kokoro_voice = to_kokoro_voice(voice).to(self._model_device())
+        kokoro_voice = as_kokoro_voice(voice).to(self._model_device())
         chunks: list[torch.Tensor] = []
 
         with torch.no_grad():

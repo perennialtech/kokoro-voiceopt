@@ -1,54 +1,21 @@
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import yaml
+
+from .artifacts import ArtifactStore
+from .serde import jsonable
 
 SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
-class RunPaths:
+class RunConfig:
+    id: str
     root: Path
-    data_dir: Path
-    audio_dir: Path
-    manifest_dir: Path
-    target_manifest: Path
-    rejected_manifest: Path
-    dataset_report: Path
-    text_plan: Path
-
-    profile_dir: Path
-    target_profile_pt: Path
-    target_profile_json: Path
-
-    corpus_dir: Path
-    corpus_pt: Path
-    corpus_manifest: Path
-
-    manifold_dir: Path
-    manifold_pt: Path
-    manifold_report: Path
-
-    optimize_dir: Path
-    optimize_stage_dir: Path
-    optimize_checkpoint_dir: Path
-    optimize_candidate_dir: Path
-    optimize_run_info: Path
-
-    export_dir: Path
-    export_voice: Path
-    export_voice_meta: Path
-    export_voice_best: Path
-    export_voice_final: Path
-    export_voice_best_optimization: Path
-
-    preview_dir: Path
 
 
 @dataclass(frozen=True)
@@ -98,7 +65,6 @@ class VoiceCorpusConfig:
     prepared_corpus_dir: Path | None = None
     voice_names: tuple[str, ...] | None = None
     include_cross_language_voices: bool = True
-    require_consistent_shape: bool = True
     dtype: str = "float32"
 
 
@@ -160,12 +126,9 @@ class SearchConfig:
 
 
 @dataclass(frozen=True)
-class Run:
-    config_path: Path
-    project_root: Path
-    id: str
-    config: dict[str, Any]
-    paths: RunPaths
+class Config:
+    schema_version: int
+    run: RunConfig
     target: TargetConfig
     audio: AudioConfig
     data: DataConfig
@@ -175,66 +138,122 @@ class Run:
     manifold: ManifoldConfig
     objective: ObjectiveConfig
     search: SearchConfig
-    device: str = "cuda"
+    device: str
+    raw: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PathLayout:
+    root: Path
+    corpus_root: Path
+
+    def _join(self, base: Path, *parts: str | Path) -> Path:
+        path = base
+        for part in parts:
+            path = path / part
+        return path
+
+    @property
+    def data_dir(self) -> Path:
+        return self.root / "data"
+
+    @property
+    def profile_dir(self) -> Path:
+        return self.root / "profile"
+
+    @property
+    def corpus_dir(self) -> Path:
+        return self.corpus_root
+
+    @property
+    def manifold_dir(self) -> Path:
+        return self.root / "manifold"
+
+    @property
+    def optimize_dir(self) -> Path:
+        return self.root / "optimize"
+
+    @property
+    def export_dir(self) -> Path:
+        return self.root / "export"
+
+    @property
+    def preview_dir(self) -> Path:
+        return self.root / "preview"
+
+    def data(self, *parts: str | Path) -> Path:
+        return self._join(self.data_dir, *parts)
+
+    def profile(self, *parts: str | Path) -> Path:
+        return self._join(self.profile_dir, *parts)
+
+    def corpus(self, *parts: str | Path) -> Path:
+        return self._join(self.corpus_dir, *parts)
+
+    def manifold(self, *parts: str | Path) -> Path:
+        return self._join(self.manifold_dir, *parts)
+
+    def optimize(self, *parts: str | Path) -> Path:
+        return self._join(self.optimize_dir, *parts)
+
+    def export(self, *parts: str | Path) -> Path:
+        return self._join(self.export_dir, *parts)
+
+    def preview(self, *parts: str | Path) -> Path:
+        return self._join(self.preview_dir, *parts)
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "root": str(self.root),
+            "data_dir": str(self.data_dir),
+            "profile_dir": str(self.profile_dir),
+            "corpus_dir": str(self.corpus_dir),
+            "manifold_dir": str(self.manifold_dir),
+            "optimize_dir": str(self.optimize_dir),
+            "export_dir": str(self.export_dir),
+            "preview_dir": str(self.preview_dir),
+        }
+
+
+@dataclass
+class Context:
+    config: Config
+    paths: PathLayout
+    artifacts: ArtifactStore
+    services: Any
+    project_root: Path
+    config_path: Path
 
     @classmethod
     def load(
-        cls, config_path: str | Path, project_root: str | Path | None = None
-    ) -> "Run":
-        config_path = Path(config_path).resolve()
-        project_root = Path(project_root or Path.cwd()).resolve()
+        cls,
+        config_path: str | Path,
+        project_root: str | Path | None = None,
+    ) -> "Context":
+        project_root_path = Path(project_root or Path.cwd()).resolve()
 
-        with open(config_path, encoding="utf-8") as file:
+        config_path_obj = Path(config_path)
+        if not config_path_obj.is_absolute():
+            base = project_root_path if project_root is not None else Path.cwd()
+            config_path_obj = base / config_path_obj
+        config_path_obj = config_path_obj.resolve()
+
+        with open(config_path_obj, encoding="utf-8") as file:
             raw = yaml.safe_load(file)
 
         if not isinstance(raw, dict):
-            raise ValueError(f"Config must be a YAML mapping: {config_path}")
+            raise ValueError(f"Config must be a YAML mapping: {config_path_obj}")
 
         if int(raw.get("schema_version", 0)) != SCHEMA_VERSION:
             raise ValueError(
                 f"Only schema_version: {SCHEMA_VERSION} configs are supported"
             )
 
-        run_cfg = dict(raw["run"])
-        run_id = str(run_cfg["id"])
-        root = resolve_path(project_root, run_cfg.get("root", f"runs/{run_id}"))
-
-        corpus_dir = root / "corpus"
-        paths = RunPaths(
-            root=root,
-            data_dir=root / "data",
-            audio_dir=root / "data" / "audio",
-            manifest_dir=root / "data" / "manifests",
-            target_manifest=root / "data" / "manifests" / "target.jsonl",
-            rejected_manifest=root / "data" / "manifests" / "rejected.jsonl",
-            dataset_report=root / "data" / "report.json",
-            text_plan=root / "data" / "text_plan.json",
-            profile_dir=root / "profile",
-            target_profile_pt=root / "profile" / "target_profile.pt",
-            target_profile_json=root / "profile" / "target_profile.json",
-            corpus_dir=corpus_dir,
-            corpus_pt=corpus_dir / "corpus.pt",
-            corpus_manifest=corpus_dir / "corpus_manifest.json",
-            manifold_dir=root / "manifold",
-            manifold_pt=root / "manifold" / "manifold.pt",
-            manifold_report=root / "manifold" / "manifold_report.json",
-            optimize_dir=root / "optimize",
-            optimize_stage_dir=root / "optimize" / "stages",
-            optimize_checkpoint_dir=root / "optimize" / "checkpoints",
-            optimize_candidate_dir=root / "optimize" / "candidates",
-            optimize_run_info=root / "optimize" / "run_info.json",
-            export_dir=root / "export",
-            export_voice=root / "export" / "voice.pt",
-            export_voice_meta=root / "export" / "voice_meta.json",
-            export_voice_best=root / "export" / "voice_best.pt",
-            export_voice_final=root / "export" / "voice_final.pt",
-            export_voice_best_optimization=root
-            / "export"
-            / "voice_best_optimization.pt",
-            preview_dir=root / "preview",
+        run_raw = dict(raw["run"])
+        run_id = str(run_raw["id"])
+        run_root = resolve_path(
+            project_root_path, run_raw.get("root", f"runs/{run_id}")
         )
-
-        target = TargetConfig(**dict(raw["target"]))
 
         assets_raw = dict(raw.get("assets", {}))
         voices_dir = assets_raw.get("voices_dir")
@@ -243,11 +262,13 @@ class Run:
 
         assets = VoiceCorpusConfig(
             repo_id=str(assets_raw.get("repo_id", "hexgrad/Kokoro-82M")),
-            voices_dir=resolve_path(project_root, voices_dir) if voices_dir else None,
+            voices_dir=(
+                resolve_path(project_root_path, voices_dir) if voices_dir else None
+            ),
             prepared_corpus_dir=(
-                resolve_path(project_root, prepared_corpus_dir)
+                resolve_path(project_root_path, prepared_corpus_dir)
                 if prepared_corpus_dir
-                else paths.corpus_dir
+                else run_root / "corpus"
             ),
             voice_names=(
                 None
@@ -257,27 +278,21 @@ class Run:
             include_cross_language_voices=bool(
                 assets_raw.get("include_cross_language_voices", True)
             ),
-            require_consistent_shape=bool(
-                assets_raw.get("require_consistent_shape", True)
-            ),
             dtype=str(assets_raw.get("dtype", "float32")),
         )
 
         text_raw = dict(raw.get("text", {}))
         validation_texts_path = text_raw.get("validation_texts_path")
         text_raw["validation_texts_path"] = (
-            resolve_path(project_root, validation_texts_path)
+            resolve_path(project_root_path, validation_texts_path)
             if validation_texts_path
             else None
         )
 
-        return cls(
-            config_path=config_path,
-            project_root=project_root,
-            id=run_id,
-            config=raw,
-            paths=paths,
-            target=target,
+        config = Config(
+            schema_version=SCHEMA_VERSION,
+            run=RunConfig(id=run_id, root=run_root),
+            target=TargetConfig(**dict(raw["target"])),
             audio=AudioConfig(**dict(raw.get("audio", {}))),
             data=DataConfig(**dict(raw.get("data", {}))),
             speaker_encoder=SpeakerEncoderConfig(
@@ -289,19 +304,73 @@ class Run:
             objective=ObjectiveConfig(**dict(raw.get("objective", {}))),
             search=SearchConfig(**dict(raw.get("search", {}))),
             device=str(raw.get("device", "cuda")),
+            raw=raw,
         )
 
-    @property
-    def corpus_dir(self) -> Path:
-        return Path(self.assets.prepared_corpus_dir or self.paths.corpus_dir)
+        paths = PathLayout(
+            root=run_root,
+            corpus_root=assets.prepared_corpus_dir or run_root / "corpus",
+        )
+
+        from .services import ServiceFactory
+
+        ctx = cls(
+            config=config,
+            paths=paths,
+            artifacts=ArtifactStore(),
+            services=None,
+            project_root=project_root_path,
+            config_path=config_path_obj,
+        )
+        ctx.services = ServiceFactory(ctx)
+        return ctx
 
     @property
-    def corpus_pt(self) -> Path:
-        return self.corpus_dir / "corpus.pt"
+    def id(self) -> str:
+        return self.config.run.id
 
     @property
-    def corpus_manifest(self) -> Path:
-        return self.corpus_dir / "corpus_manifest.json"
+    def target(self) -> TargetConfig:
+        return self.config.target
+
+    @property
+    def audio(self) -> AudioConfig:
+        return self.config.audio
+
+    @property
+    def data(self) -> DataConfig:
+        return self.config.data
+
+    @property
+    def speaker_encoder(self) -> SpeakerEncoderConfig:
+        return self.config.speaker_encoder
+
+    @property
+    def assets(self) -> VoiceCorpusConfig:
+        return self.config.assets
+
+    @property
+    def text(self) -> TextConfig:
+        return self.config.text
+
+    @property
+    def manifold(self) -> ManifoldConfig:
+        return self.config.manifold
+
+    @property
+    def objective(self) -> ObjectiveConfig:
+        return self.config.objective
+
+    @property
+    def search(self) -> SearchConfig:
+        return self.config.search
+
+    @property
+    def device(self) -> str:
+        return self.config.device
+
+    def resolve_path(self, path: str | Path) -> Path:
+        return resolve_path(self.project_root, path)
 
     def write_resolved_config(self) -> None:
         self.paths.root.mkdir(parents=True, exist_ok=True)
@@ -311,29 +380,39 @@ class Run:
             yaml.safe_dump(self.to_dict(), file, sort_keys=False, allow_unicode=True)
 
     def to_dict(self) -> dict[str, Any]:
-        result = dict(self.config)
-        result["resolved_paths"] = {
-            key: str(value) for key, value in asdict(self.paths).items()
-        }
-        result["resolved_assets"] = {
+        raw = dict(self.config.raw)
+        raw["resolved_paths"] = self.paths.as_dict()
+        raw["resolved_assets"] = {
             "repo_id": self.assets.repo_id,
             "voices_dir": (
                 str(self.assets.voices_dir) if self.assets.voices_dir else None
             ),
-            "prepared_corpus_dir": str(self.corpus_dir),
+            "prepared_corpus_dir": str(self.paths.corpus_dir),
             "voice_names": (
                 list(self.assets.voice_names) if self.assets.voice_names else None
             ),
             "include_cross_language_voices": self.assets.include_cross_language_voices,
-            "require_consistent_shape": self.assets.require_consistent_shape,
             "dtype": self.assets.dtype,
         }
-        return result
+        raw["resolved_config"] = {
+            "run": jsonable(asdict(self.config.run)),
+            "target": jsonable(asdict(self.target)),
+            "audio": jsonable(asdict(self.audio)),
+            "data": jsonable(asdict(self.data)),
+            "speaker_encoder": jsonable(asdict(self.speaker_encoder)),
+            "assets": jsonable(asdict(self.assets)),
+            "text": jsonable(asdict(self.text)),
+            "manifold": jsonable(asdict(self.manifold)),
+            "objective": jsonable(asdict(self.objective)),
+            "search": jsonable(asdict(self.search)),
+            "device": self.device,
+        }
+        return raw
 
     def require_manifests(self) -> None:
         require_paths(
             [
-                ("target_manifest", self.paths.target_manifest, False),
+                ("target_manifest", self.paths.data("manifests/target.jsonl"), False),
             ],
             "Required prepared target data missing:",
         )
@@ -341,8 +420,12 @@ class Run:
     def require_profile(self) -> None:
         require_paths(
             [
-                ("target_profile_pt", self.paths.target_profile_pt, False),
-                ("target_profile_json", self.paths.target_profile_json, False),
+                ("target_profile_pt", self.paths.profile("target_profile.pt"), False),
+                (
+                    "target_profile_json",
+                    self.paths.profile("target_profile.json"),
+                    False,
+                ),
             ],
             "Required target profile missing:",
         )
@@ -350,8 +433,8 @@ class Run:
     def require_corpus(self) -> None:
         require_paths(
             [
-                ("corpus_pt", self.corpus_pt, False),
-                ("corpus_manifest", self.corpus_manifest, False),
+                ("corpus_pt", self.paths.corpus("corpus.pt"), False),
+                ("corpus_manifest", self.paths.corpus("corpus_manifest.json"), False),
             ],
             "Required prepared voice corpus missing:",
         )
@@ -372,60 +455,3 @@ def require_paths(required: list[tuple[str, str | Path, bool]], message: str) ->
 
     if missing:
         raise FileNotFoundError(f"{message}\n  - " + "\n  - ".join(missing))
-
-
-def read_jsonl(path: str | Path) -> list[dict[str, Any]]:
-    with open(path, encoding="utf-8") as file:
-        return [json.loads(line) for line in file if line.strip()]
-
-
-def write_jsonl(path: str | Path, rows: list[dict[str, Any]]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as file:
-        for row in rows:
-            file.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def hash_text(text: str) -> str:
-    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()
-
-
-def hash_file(path: str | Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as file:
-        while True:
-            chunk = file.read(chunk_size)
-            if not chunk:
-                break
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def stable_hash_json(value: Any) -> str:
-    encoded = json.dumps(to_jsonable(value), sort_keys=True, ensure_ascii=False).encode(
-        "utf-8"
-    )
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def recursive_namespace(value: Any) -> Any:
-    if isinstance(value, dict):
-        return SimpleNamespace(
-            **{key: recursive_namespace(item) for key, item in value.items()}
-        )
-    if isinstance(value, list):
-        return [recursive_namespace(item) for item in value]
-    return value
-
-
-def to_jsonable(value: Any) -> Any:
-    if isinstance(value, Path):
-        return str(value)
-    if hasattr(value, "__dataclass_fields__"):
-        return to_jsonable(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [to_jsonable(item) for item in value]
-    return value

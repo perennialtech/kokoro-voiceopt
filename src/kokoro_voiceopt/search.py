@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
-import numpy as np
 import torch
 from tqdm import tqdm
 
-from .config import SearchConfig
+from .config import PathLayout, SearchConfig
 from .corpus import VoiceCorpus
 from .objective import CandidateEval, LatentInfo, VoiceObjective
+from .serde import fingerprint, save_pt, sha256_tensor, write_json
+from .voice import as_voice_2d, save_voice, voice_hash
 
 
 @dataclass
@@ -24,7 +24,8 @@ class Candidate:
     eval: CandidateEval
     iteration: int | None
     created_at: str
-    candidate_hash: str
+    voice_hash: str
+    candidate_id: str
     metadata: dict
 
     def to_dict(self) -> dict:
@@ -32,7 +33,8 @@ class Candidate:
             "stage": self.stage,
             "iteration": self.iteration,
             "created_at": self.created_at,
-            "candidate_hash": self.candidate_hash,
+            "voice_hash": self.voice_hash,
+            "candidate_id": self.candidate_id,
             "params_shape": (
                 list(self.params.shape) if self.params is not None else None
             ),
@@ -43,59 +45,26 @@ class Candidate:
 
 
 @dataclass
-class NESResult:
-    best_params: torch.Tensor
-    final_params: torch.Tensor
-    best_loss: float
-    history: list[dict]
-    best_eval: CandidateEval
-    best_candidate: Candidate
-    final_candidate: Candidate
-    checkpoint_candidates: list[Candidate]
-
-
-@dataclass
-class BaselineResult:
+class SearchResult:
+    stage: str
     candidates: list[Candidate]
-    top_candidates: list[Candidate]
-    best_candidate: Candidate
-
-
-@dataclass
-class BlendResult:
-    result: NESResult
-    best_candidate: Candidate
-    final_candidate: Candidate
-
-
-@dataclass
-class LatentResult:
-    result: NESResult
-    best_candidate: Candidate
-    final_candidate: Candidate
-    checkpoint_candidates: list[Candidate]
-
-
-@dataclass
-class ValidationResult:
-    candidates: list[Candidate]
-    best_candidate: Candidate
-
-
-def voice_hash(voice: torch.Tensor) -> str:
-    array = (
-        voice.detach()
-        .cpu()
-        .to(torch.float32)
-        .contiguous()
-        .numpy()
-        .astype(np.float32, copy=False)
-    )
-    return hashlib.sha256(array.tobytes()).hexdigest()
+    best: Candidate
+    final: Candidate | None = None
+    checkpoints: list[Candidate] = field(default_factory=list)
+    history: list[dict] = field(default_factory=list)
+    top: list[Candidate] = field(default_factory=list)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def params_hash(params: torch.Tensor | None) -> str | None:
+    return (
+        None
+        if params is None
+        else sha256_tensor(params.detach().cpu().to(torch.float32).contiguous())
+    )
 
 
 def make_candidate(
@@ -106,32 +75,71 @@ def make_candidate(
     iteration: int | None = None,
     metadata: dict | None = None,
 ) -> Candidate:
-    voice = voice.detach().cpu().to(torch.float32).contiguous()
-    params = (
+    normalized_voice = as_voice_2d(voice)
+    normalized_params = (
         None if params is None else params.detach().cpu().to(torch.float32).contiguous()
     )
+    metadata = dict(metadata or {})
+    vhash = voice_hash(normalized_voice)
+    candidate_id = fingerprint(
+        {
+            "stage": stage,
+            "iteration": iteration,
+            "voice_hash": vhash,
+            "params_hash": params_hash(normalized_params),
+            "metadata": metadata,
+            "eval": eval_result.to_dict(),
+        }
+    )
+
     return Candidate(
         stage=stage,
-        params=params,
-        voice=voice,
+        params=normalized_params,
+        voice=normalized_voice,
         eval=eval_result,
         iteration=iteration,
         created_at=_now(),
-        candidate_hash=voice_hash(voice),
-        metadata=dict(metadata or {}),
+        voice_hash=vhash,
+        candidate_id=candidate_id,
+        metadata=metadata,
     )
 
 
-def save_candidate_artifacts(candidate: Candidate, candidate_dir: str | Path) -> None:
-    candidate_dir = Path(candidate_dir)
-    candidate_dir.mkdir(parents=True, exist_ok=True)
-    base = candidate_dir / candidate.candidate_hash
+def save_candidate_artifacts(candidate: Candidate, paths: PathLayout) -> None:
+    voices_dir = paths.optimize("voices")
+    evaluations_dir = paths.optimize("evaluations")
+    candidates_dir = paths.optimize("candidates")
+    params_dir = paths.optimize("params")
 
-    with open(base.with_suffix(".json"), "w", encoding="utf-8") as file:
-        json.dump(candidate.to_dict(), file, indent=2, ensure_ascii=False)
+    voices_dir.mkdir(parents=True, exist_ok=True)
+    evaluations_dir.mkdir(parents=True, exist_ok=True)
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    params_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save(
+    voice_path = voices_dir / f"{candidate.voice_hash}.pt"
+    if not voice_path.exists():
+        save_voice(voice_path, candidate.voice)
+
+    if candidate.params is not None:
+        save_pt(params_dir / f"{candidate.candidate_id}.pt", candidate.params)
+
+    write_json(
+        evaluations_dir / f"{candidate.candidate_id}.json",
         {
+            "candidate_id": candidate.candidate_id,
+            "voice_hash": candidate.voice_hash,
+            "stage": candidate.stage,
+            "iteration": candidate.iteration,
+            "metadata": candidate.metadata,
+            "eval": candidate.eval.to_dict(),
+        },
+    )
+    write_json(candidates_dir / f"{candidate.candidate_id}.json", candidate.to_dict())
+    save_pt(
+        candidates_dir / f"{candidate.candidate_id}.pt",
+        {
+            "voice_hash": candidate.voice_hash,
+            "candidate_id": candidate.candidate_id,
             "voice": candidate.voice.cpu().to(torch.float32).contiguous(),
             "params": (
                 None
@@ -140,7 +148,6 @@ def save_candidate_artifacts(candidate: Candidate, candidate_dir: str | Path) ->
             ),
             "candidate": candidate.to_dict(),
         },
-        base.with_suffix(".pt"),
     )
 
 
@@ -152,14 +159,19 @@ def _append_jsonl(path: Path | None, row: dict) -> None:
         file.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def _save_checkpoint(candidate: Candidate, checkpoint_dir: Path | None) -> None:
-    if checkpoint_dir is None:
+def _save_checkpoint(candidate: Candidate, paths: PathLayout | None) -> None:
+    if paths is None:
         return
+    checkpoint_dir = paths.optimize("checkpoints")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     safe_stage = candidate.stage.replace(":", "_").replace("/", "_")
     iteration = candidate.iteration if candidate.iteration is not None else 0
-    torch.save(
+    save_pt(
+        checkpoint_dir
+        / f"{safe_stage}_{iteration:06d}_{candidate.candidate_id[:10]}.pt",
         {
+            "voice_hash": candidate.voice_hash,
+            "candidate_id": candidate.candidate_id,
             "voice": candidate.voice.cpu().to(torch.float32).contiguous(),
             "params": (
                 None
@@ -168,8 +180,6 @@ def _save_checkpoint(candidate: Candidate, checkpoint_dir: Path | None) -> None:
             ),
             "candidate": candidate.to_dict(),
         },
-        checkpoint_dir
-        / f"{safe_stage}_{iteration:06d}_{candidate.candidate_hash[:10]}.pt",
     )
 
 
@@ -179,9 +189,9 @@ def run_baseline_scan(
     texts: list[str],
     top_k: int,
     metadata: dict | None = None,
-) -> BaselineResult:
+) -> SearchResult:
     voices = [record.tensor for record in corpus.records]
-    evals = objective.evaluate_voices(voices, texts)
+    evals = objective.evaluate_voices(voices, texts, include_latent_penalties=False)
 
     candidates = [
         make_candidate(
@@ -194,18 +204,22 @@ def run_baseline_scan(
         )
         for record, eval_result in zip(corpus.records, evals)
     ]
-    candidates.sort(key=lambda c: c.eval.total_loss)
+    candidates.sort(key=lambda candidate: candidate.eval.total_loss)
 
-    return BaselineResult(
+    return SearchResult(
+        stage="baseline",
         candidates=candidates,
-        top_candidates=candidates[:top_k],
-        best_candidate=candidates[0],
+        top=candidates[:top_k],
+        best=candidates[0],
+        final=None,
+        checkpoints=[],
+        history=[],
     )
 
 
 def convex_blend(logits: torch.Tensor, voices: list[torch.Tensor]) -> torch.Tensor:
     weights = torch.softmax(logits.to(torch.float32).cpu(), dim=0)
-    stacked = torch.stack([v.detach().cpu().to(torch.float32) for v in voices], dim=0)
+    stacked = torch.stack([as_voice_2d(voice) for voice in voices], dim=0)
     return (weights.view(-1, 1, 1) * stacked).sum(dim=0).contiguous()
 
 
@@ -214,7 +228,9 @@ class AntitheticNES:
         self.config = config
 
     def _clamp(
-        self, params: torch.Tensor, bounds: tuple[float, float] | None
+        self,
+        params: torch.Tensor,
+        bounds: tuple[float, float] | None,
     ) -> torch.Tensor:
         params = params.to(torch.float32).cpu()
         if bounds is None:
@@ -223,7 +239,11 @@ class AntitheticNES:
         return params.clamp(float(lo), float(hi)).contiguous()
 
     def _sigma(
-        self, iteration: int, iterations: int, initial: float, final: float
+        self,
+        iteration: int,
+        iterations: int,
+        initial: float,
+        final: float,
     ) -> float:
         if iterations <= 1:
             return float(final)
@@ -247,13 +267,11 @@ class AntitheticNES:
         save_every: int,
         metadata: dict | None = None,
         history_path: Path | None = None,
-        checkpoint_dir: Path | None = None,
-        candidate_dir: Path | None = None,
-        validation_texts: list[str] | None = None,
+        paths: PathLayout | None = None,
         validation_evaluate: (
             Callable[[list[torch.Tensor]], list[CandidateEval]] | None
         ) = None,
-    ) -> NESResult:
+    ) -> SearchResult:
         params = self._clamp(initial_params.detach().cpu().to(torch.float32), bounds)
         dim = params.numel()
 
@@ -292,16 +310,18 @@ class AntitheticNES:
                 param_list.append(self._clamp(params + sigma * eps, bounds))
                 param_list.append(self._clamp(params - sigma * eps, bounds))
 
-            voices = [decode(p) for p in param_list]
+            voices = [decode(candidate_params) for candidate_params in param_list]
             evals = evaluate(voices, param_list)
-            losses = torch.tensor([e.total_loss for e in evals], dtype=torch.float32)
+            losses = torch.tensor(
+                [eval_result.total_loss for eval_result in evals], dtype=torch.float32
+            )
 
-            for p, voice, eval_result in zip(param_list, voices, evals):
+            for candidate_params, voice, eval_result in zip(param_list, voices, evals):
                 candidate = make_candidate(
                     stage,
                     voice,
                     eval_result,
-                    params=p,
+                    params=candidate_params,
                     iteration=iteration,
                     metadata=metadata,
                 )
@@ -336,18 +356,21 @@ class AntitheticNES:
                 "population_std_loss": float(loss_std),
                 "sigma": sigma,
                 "learning_rate": learning_rate,
-                "best_candidate_hash": best_candidate.candidate_hash,
+                "best_candidate_id": best_candidate.candidate_id,
+                "best_voice_hash": best_candidate.voice_hash,
             }
 
             if (
-                validation_texts
-                and validation_evaluate is not None
+                validation_evaluate is not None
                 and self.config.validate_every > 0
                 and iteration % self.config.validate_every == 0
             ):
                 validation_eval = validation_evaluate([best_candidate.voice])[0]
                 row["validation_loss"] = validation_eval.total_loss
                 row["validation_similarity"] = validation_eval.mean_similarity
+                row["validation_includes_search_penalties"] = (
+                    validation_eval.include_latent_penalties
+                )
 
             history.append(row)
             _append_jsonl(history_path, row)
@@ -371,9 +394,9 @@ class AntitheticNES:
                     metadata=metadata,
                 )
                 checkpoint_candidates.append(checkpoint)
-                _save_checkpoint(checkpoint, checkpoint_dir)
-                if candidate_dir is not None:
-                    save_candidate_artifacts(checkpoint, candidate_dir)
+                _save_checkpoint(checkpoint, paths)
+                if paths is not None:
+                    save_candidate_artifacts(checkpoint, paths)
                 if checkpoint.eval.total_loss < best_candidate.eval.total_loss:
                     best_candidate = checkpoint
 
@@ -390,33 +413,36 @@ class AntitheticNES:
         if final_candidate.eval.total_loss < best_candidate.eval.total_loss:
             best_candidate = final_candidate
 
-        if candidate_dir is not None:
-            save_candidate_artifacts(best_candidate, candidate_dir)
-            save_candidate_artifacts(final_candidate, candidate_dir)
+        if paths is not None:
+            save_candidate_artifacts(best_candidate, paths)
+            save_candidate_artifacts(final_candidate, paths)
 
-        return NESResult(
-            best_params=best_candidate.params.clone(),
-            final_params=params.clone(),
-            best_loss=best_candidate.eval.total_loss,
+        candidates = [best_candidate, final_candidate, *checkpoint_candidates]
+        unique: dict[str, Candidate] = {
+            candidate.candidate_id: candidate for candidate in candidates
+        }
+
+        return SearchResult(
+            stage=stage,
+            candidates=list(unique.values()),
+            best=best_candidate,
+            final=final_candidate,
+            checkpoints=checkpoint_candidates,
             history=history,
-            best_eval=best_candidate.eval,
-            best_candidate=best_candidate,
-            final_candidate=final_candidate,
-            checkpoint_candidates=checkpoint_candidates,
+            top=[],
         )
 
 
-def run_blend_search(
+def run_blend_stage(
     top_candidates: list[Candidate],
     objective: VoiceObjective,
     texts: list[str],
     config: SearchConfig,
     metadata: dict | None = None,
     history_path: Path | None = None,
-    checkpoint_dir: Path | None = None,
-    candidate_dir: Path | None = None,
+    paths: PathLayout | None = None,
     validation_texts: list[str] | None = None,
-) -> BlendResult:
+) -> SearchResult:
     if not top_candidates:
         raise ValueError("Blend search requires at least one baseline candidate")
 
@@ -429,12 +455,20 @@ def run_blend_search(
         return convex_blend(params, voices)
 
     def evaluate(candidate_voices, params_list):
-        return objective.evaluate_voices(candidate_voices, texts)
+        return objective.evaluate_voices(
+            candidate_voices,
+            texts,
+            include_latent_penalties=False,
+        )
 
     def validation_evaluate(candidate_voices):
-        return objective.evaluate_voices(candidate_voices, validation_texts or texts)
+        return objective.evaluate_voices(
+            candidate_voices,
+            validation_texts or texts,
+            include_latent_penalties=False,
+        )
 
-    result = nes.run(
+    return nes.run(
         initial_params=logits,
         decode=decode,
         evaluate=evaluate,
@@ -448,20 +482,12 @@ def run_blend_search(
         save_every=config.save_every,
         metadata=metadata,
         history_path=history_path,
-        checkpoint_dir=checkpoint_dir,
-        candidate_dir=candidate_dir,
-        validation_texts=validation_texts,
-        validation_evaluate=validation_evaluate,
-    )
-
-    return BlendResult(
-        result=result,
-        best_candidate=result.best_candidate,
-        final_candidate=result.final_candidate,
+        paths=paths,
+        validation_evaluate=validation_evaluate if validation_texts else None,
     )
 
 
-def run_latent_search(
+def run_latent_stage(
     manifold,
     initial_z: torch.Tensor,
     objective: VoiceObjective,
@@ -469,10 +495,9 @@ def run_latent_search(
     config: SearchConfig,
     metadata: dict | None = None,
     history_path: Path | None = None,
-    checkpoint_dir: Path | None = None,
-    candidate_dir: Path | None = None,
+    paths: PathLayout | None = None,
     validation_texts: list[str] | None = None,
-) -> LatentResult:
+) -> SearchResult:
     nes = AntitheticNES(config)
 
     def decode(params: torch.Tensor) -> torch.Tensor:
@@ -480,14 +505,24 @@ def run_latent_search(
 
     def evaluate(candidate_voices, params_list):
         infos = [
-            LatentInfo(z=manifold.clamp_z(p), manifold=manifold) for p in params_list
+            LatentInfo(z=manifold.clamp_z(params), manifold=manifold)
+            for params in params_list
         ]
-        return objective.evaluate_voices(candidate_voices, texts, latent_info=infos)
+        return objective.evaluate_voices(
+            candidate_voices,
+            texts,
+            latent_info=infos,
+            include_latent_penalties=True,
+        )
 
     def validation_evaluate(candidate_voices):
-        return objective.evaluate_voices(candidate_voices, validation_texts or texts)
+        return objective.evaluate_voices(
+            candidate_voices,
+            validation_texts or texts,
+            include_latent_penalties=False,
+        )
 
-    result = nes.run(
+    return nes.run(
         initial_params=manifold.clamp_z(initial_z),
         decode=decode,
         evaluate=evaluate,
@@ -501,17 +536,8 @@ def run_latent_search(
         save_every=config.save_every,
         metadata=metadata,
         history_path=history_path,
-        checkpoint_dir=checkpoint_dir,
-        candidate_dir=candidate_dir,
-        validation_texts=validation_texts,
-        validation_evaluate=validation_evaluate,
-    )
-
-    return LatentResult(
-        result=result,
-        best_candidate=result.best_candidate,
-        final_candidate=result.final_candidate,
-        checkpoint_candidates=result.checkpoint_candidates,
+        paths=paths,
+        validation_evaluate=validation_evaluate if validation_texts else None,
     )
 
 
@@ -520,12 +546,29 @@ def validate_candidates(
     objective: VoiceObjective,
     texts: list[str],
     metadata: dict | None = None,
-) -> ValidationResult:
+    *,
+    include_search_penalties: bool = False,
+    latent_info_resolver: Callable[[Candidate], LatentInfo | None] | None = None,
+) -> SearchResult:
     if not candidates:
         raise ValueError("No candidates provided for validation")
 
     voices = [candidate.voice for candidate in candidates]
-    evals = objective.evaluate_voices(voices, texts)
+
+    latent_infos: list[LatentInfo | None] | None = None
+    if include_search_penalties:
+        if latent_info_resolver is None:
+            raise ValueError(
+                "include_search_penalties=True requires latent_info_resolver"
+            )
+        latent_infos = [latent_info_resolver(candidate) for candidate in candidates]
+
+    evals = objective.evaluate_voices(
+        voices,
+        texts,
+        latent_info=latent_infos,
+        include_latent_penalties=include_search_penalties,
+    )
 
     validated = [
         make_candidate(
@@ -534,13 +577,22 @@ def validate_candidates(
             eval_result=eval_result,
             params=candidate.params,
             iteration=candidate.iteration,
-            metadata=metadata or candidate.metadata,
+            metadata={
+                **candidate.metadata,
+                **(metadata or {}),
+                "validation_includes_search_penalties": include_search_penalties,
+            },
         )
         for candidate, eval_result in zip(candidates, evals)
     ]
-    validated.sort(key=lambda c: c.eval.total_loss)
+    validated.sort(key=lambda candidate: candidate.eval.total_loss)
 
-    return ValidationResult(
+    return SearchResult(
+        stage="validation",
         candidates=validated,
-        best_candidate=validated[0],
+        best=validated[0],
+        final=None,
+        checkpoints=[],
+        history=[],
+        top=[],
     )

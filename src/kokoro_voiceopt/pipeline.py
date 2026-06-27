@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,18 +8,16 @@ import numpy as np
 import torch
 import torchaudio
 
-from .config import Run, hash_file, stable_hash_json
+from .config import Context
 from .corpus import VoiceCorpus
-from .io import save_json, save_voice
 from .manifold import load_or_build_manifold
 from .objective import VoiceObjective
 from .profile import load_target_speaker_profile
-from .search import (run_baseline_scan, run_blend_search,
-                     run_latent_search, save_candidate_artifacts,
-                     validate_candidates)
-from .speaker import WavLMXVectorSpeakerEncoder
-from .synth import KokoroSynthesizer
-from .textplan import load_text_plan
+from .search import (run_baseline_scan, run_blend_stage, run_latent_stage,
+                     save_candidate_artifacts, validate_candidates)
+from .serde import fingerprint, load_pt, read_json, sha256_file, write_json
+from .transcript import load_text_plan
+from .voice import save_voice, voice_hash
 
 
 @dataclass
@@ -34,95 +31,105 @@ class VoiceOptimizationResult:
     blend_best_similarity: float
     latent_best_similarity: float
     selected_stage: str
-    selected_candidate_hash: str
+    selected_candidate_id: str
+    selected_voice_hash: str
 
 
 class VoiceOptimizationPipeline:
-    def __init__(self, run: Run):
-        self.run = run
+    def __init__(self, ctx: Context):
+        self.ctx = ctx
 
     def run(self) -> VoiceOptimizationResult:
-        self._set_seed(self.run.search.seed)
+        self._set_seed(self.ctx.search.seed)
         self._prepare_dirs()
-        self.run.write_resolved_config()
+        self.ctx.write_resolved_config()
 
-        self.run.require_manifests()
-        self.run.require_profile()
-        self.run.require_corpus()
+        self.ctx.require_manifests()
+        self.ctx.require_profile()
+        self.ctx.require_corpus()
 
-        text_plan = load_text_plan(self.run)
-        target_profile = load_target_speaker_profile(self.run)
-        corpus = VoiceCorpus.load(self.run)
+        text_plan = load_text_plan(self.ctx)
+        target_profile = load_target_speaker_profile(self.ctx)
+        corpus = VoiceCorpus.load(self.ctx)
 
-        speaker = WavLMXVectorSpeakerEncoder(self.run.speaker_encoder, self.run.device)
-        synthesizer = self._create_synthesizer()
+        speaker = self.ctx.services.speaker_encoder()
+        synthesizer = self.ctx.services.synthesizer()
         objective = VoiceObjective(
             synthesizer=synthesizer,
             speaker_encoder=speaker,
             target_profile=target_profile,
-            audio_config=self.run.audio,
-            objective_config=self.run.objective,
+            audio_config=self.ctx.audio,
+            objective_config=self.ctx.objective,
         )
 
         artifact_metadata = {
             "schema_version": 1,
-            "corpus_manifest_sha256": hash_file(self.run.corpus_manifest),
-            "target_profile_sha256": hash_file(self.run.paths.target_profile_pt),
-            "objective_config_sha256": stable_hash_json(self.run.objective),
-            "search_config_sha256": stable_hash_json(self.run.search),
+            "text_plan_sha256": sha256_file(self.ctx.paths.data("text_plan.json")),
+            "optimization_texts_sha256": fingerprint(text_plan.optimization_texts),
+            "validation_texts_sha256": fingerprint(text_plan.validation_texts),
+            "objective_config_sha256": fingerprint(self.ctx.objective),
+            "search_config_sha256": fingerprint(self.ctx.search),
+            "corpus_manifest_sha256": sha256_file(
+                self.ctx.paths.corpus("corpus_manifest.json")
+            ),
+            "corpus_sha256": corpus.corpus_sha256,
+            "target_profile_sha256": sha256_file(
+                self.ctx.paths.profile("target_profile.pt")
+            ),
         }
 
         baseline = run_baseline_scan(
             corpus=corpus,
             objective=objective,
             texts=text_plan.optimization_texts,
-            top_k=self.run.search.top_k_for_blend,
+            top_k=self.ctx.search.top_k_for_blend,
             metadata=artifact_metadata,
         )
-        save_json(
-            self.run.paths.optimize_stage_dir / "baseline.json",
+        write_json(
+            self.ctx.paths.optimize("stages/baseline.json"),
             [candidate.to_dict() for candidate in baseline.candidates],
         )
         for candidate in baseline.candidates:
-            save_candidate_artifacts(candidate, self.run.paths.optimize_candidate_dir)
+            save_candidate_artifacts(candidate, self.ctx.paths)
 
-        blend = run_blend_search(
-            top_candidates=baseline.top_candidates,
+        blend = run_blend_stage(
+            top_candidates=baseline.top,
             objective=objective,
             texts=text_plan.optimization_texts,
-            config=self.run.search,
+            config=self.ctx.search,
             metadata=artifact_metadata,
-            history_path=self.run.paths.optimize_stage_dir / "blend_history.jsonl",
-            checkpoint_dir=self.run.paths.optimize_checkpoint_dir,
-            candidate_dir=self.run.paths.optimize_candidate_dir,
+            history_path=self.ctx.paths.optimize("stages/blend_history.jsonl"),
+            paths=self.ctx.paths,
             validation_texts=text_plan.validation_texts,
         )
 
-        manifold = load_or_build_manifold(self.run, corpus)
-        initial_z = manifold.encode(blend.best_candidate.voice)
+        manifold = load_or_build_manifold(self.ctx, corpus)
+        initial_z = manifold.encode(blend.best.voice)
 
-        latent = run_latent_search(
+        latent = run_latent_stage(
             manifold=manifold,
             initial_z=initial_z,
             objective=objective,
             texts=text_plan.optimization_texts,
-            config=self.run.search,
+            config=self.ctx.search,
             metadata=artifact_metadata,
-            history_path=self.run.paths.optimize_stage_dir / "latent_history.jsonl",
-            checkpoint_dir=self.run.paths.optimize_checkpoint_dir,
-            candidate_dir=self.run.paths.optimize_candidate_dir,
+            history_path=self.ctx.paths.optimize("stages/latent_history.jsonl"),
+            paths=self.ctx.paths,
             validation_texts=text_plan.validation_texts,
         )
 
         optimization_candidates = [
-            baseline.best_candidate,
-            blend.best_candidate,
-            latent.best_candidate,
-            latent.final_candidate,
-            *latent.checkpoint_candidates,
+            baseline.best,
+            blend.best,
+            latent.best,
+            latent.final,
+            *latent.checkpoints,
+        ]
+        optimization_candidates = [
+            candidate for candidate in optimization_candidates if candidate is not None
         ]
         best_optimization = min(
-            optimization_candidates, key=lambda c: c.eval.total_loss
+            optimization_candidates, key=lambda candidate: candidate.eval.total_loss
         )
 
         validation = validate_candidates(
@@ -130,74 +137,66 @@ class VoiceOptimizationPipeline:
             objective=objective,
             texts=text_plan.validation_texts,
             metadata=artifact_metadata,
+            include_search_penalties=False,
         )
-        save_json(
-            self.run.paths.optimize_stage_dir / "validation.json",
+        write_json(
+            self.ctx.paths.optimize("stages/validation.json"),
             [candidate.to_dict() for candidate in validation.candidates],
         )
         for candidate in validation.candidates:
-            save_candidate_artifacts(candidate, self.run.paths.optimize_candidate_dir)
+            save_candidate_artifacts(candidate, self.ctx.paths)
 
-        best_validation = validation.best_candidate
-        final_candidate = latent.final_candidate
+        best_validation = validation.best
+        final_candidate = latent.final
+        if final_candidate is None:
+            raise RuntimeError("Latent search did not produce a final candidate")
 
-        save_voice(self.run.paths.export_voice_best, best_validation.voice)
-        save_voice(self.run.paths.export_voice_final, final_candidate.voice)
+        save_voice(self.ctx.paths.export("voice_best.pt"), best_validation.voice)
+        save_voice(self.ctx.paths.export("voice_final.pt"), final_candidate.voice)
         save_voice(
-            self.run.paths.export_voice_best_optimization, best_optimization.voice
+            self.ctx.paths.export("voice_best_optimization.pt"), best_optimization.voice
         )
 
-        save_json(
-            self.run.paths.export_dir / "voice_best_meta.json",
-            best_validation.to_dict(),
+        write_json(
+            self.ctx.paths.export("voice_best_meta.json"), best_validation.to_dict()
         )
-        save_json(
-            self.run.paths.export_dir / "voice_final_meta.json",
-            final_candidate.to_dict(),
+        write_json(
+            self.ctx.paths.export("voice_final_meta.json"), final_candidate.to_dict()
         )
-        save_json(
-            self.run.paths.export_dir / "voice_best_optimization_meta.json",
+        write_json(
+            self.ctx.paths.export("voice_best_optimization_meta.json"),
             best_optimization.to_dict(),
         )
 
-        save_voice(self.run.paths.export_voice, best_validation.voice)
-        save_json(self.run.paths.export_voice_meta, best_validation.to_dict())
+        save_voice(self.ctx.paths.export("voice.pt"), best_validation.voice)
+        write_json(self.ctx.paths.export("voice_meta.json"), best_validation.to_dict())
 
         result = VoiceOptimizationResult(
-            output_dir=self.run.paths.optimize_dir,
-            best_voice_path=self.run.paths.export_voice_best,
-            final_voice_path=self.run.paths.export_voice_final,
+            output_dir=self.ctx.paths.optimize_dir,
+            best_voice_path=self.ctx.paths.export("voice_best.pt"),
+            final_voice_path=self.ctx.paths.export("voice_final.pt"),
             best_validation_loss=best_validation.eval.total_loss,
             best_optimization_loss=best_optimization.eval.total_loss,
-            baseline_best_similarity=baseline.best_candidate.eval.mean_similarity,
-            blend_best_similarity=blend.best_candidate.eval.mean_similarity,
-            latent_best_similarity=latent.best_candidate.eval.mean_similarity,
+            baseline_best_similarity=baseline.best.eval.mean_similarity,
+            blend_best_similarity=blend.best.eval.mean_similarity,
+            latent_best_similarity=latent.best.eval.mean_similarity,
             selected_stage=best_validation.stage,
-            selected_candidate_hash=best_validation.candidate_hash,
+            selected_candidate_id=best_validation.candidate_id,
+            selected_voice_hash=best_validation.voice_hash,
         )
-        save_json(self.run.paths.optimize_run_info, result)
+        write_json(self.ctx.paths.optimize("run_info.json"), result)
         return result
-
-    def _create_synthesizer(self) -> KokoroSynthesizer:
-        from kokoro import KPipeline
-
-        pipeline = KPipeline(
-            lang_code=self.run.target.lang_code,
-            repo_id=self.run.assets.repo_id,
-            device=self.run.device,
-        )
-        return KokoroSynthesizer(
-            pipeline,
-            sample_rate=self.run.audio.kokoro_sample_rate,
-        )
 
     def _prepare_dirs(self) -> None:
         for path in [
-            self.run.paths.optimize_dir,
-            self.run.paths.optimize_stage_dir,
-            self.run.paths.optimize_checkpoint_dir,
-            self.run.paths.optimize_candidate_dir,
-            self.run.paths.export_dir,
+            self.ctx.paths.optimize_dir,
+            self.ctx.paths.optimize("stages"),
+            self.ctx.paths.optimize("checkpoints"),
+            self.ctx.paths.optimize("voices"),
+            self.ctx.paths.optimize("evaluations"),
+            self.ctx.paths.optimize("candidates"),
+            self.ctx.paths.optimize("params"),
+            self.ctx.paths.export_dir,
         ]:
             path.mkdir(parents=True, exist_ok=True)
 
@@ -209,82 +208,90 @@ class VoiceOptimizationPipeline:
             torch.cuda.manual_seed_all(seed)
 
 
-def _load_candidate_by_hash(run: Run, candidate_hash: str) -> tuple[torch.Tensor, dict]:
-    path = run.paths.optimize_candidate_dir / f"{candidate_hash}.pt"
-    if not path.exists():
-        raise FileNotFoundError(f"Candidate hash not found: {candidate_hash}")
-    data = torch.load(path, map_location="cpu")
-    return data["voice"].to(torch.float32).contiguous(), dict(data["candidate"])
+def _load_voice_by_hash(ctx: Context, requested_voice_hash: str) -> torch.Tensor:
+    path = ctx.paths.optimize("voices", f"{requested_voice_hash}.pt")
+    if path.exists():
+        return load_pt(path).to(torch.float32).contiguous()
+
+    for exported in [
+        ctx.paths.export("voice.pt"),
+        ctx.paths.export("voice_best.pt"),
+        ctx.paths.export("voice_final.pt"),
+        ctx.paths.export("voice_best_optimization.pt"),
+    ]:
+        if exported.exists():
+            voice = load_pt(exported).to(torch.float32).contiguous()
+            if voice_hash(voice) == requested_voice_hash:
+                return voice
+
+    raise FileNotFoundError(f"Voice hash not found: {requested_voice_hash}")
 
 
 def export_voice(
-    run: Run,
+    ctx: Context,
     candidate: str = "best",
     voice_out: Path | None = None,
     meta_out: Path | None = None,
 ) -> None:
-    run.paths.export_dir.mkdir(parents=True, exist_ok=True)
+    ctx.paths.export_dir.mkdir(parents=True, exist_ok=True)
 
     if candidate == "best":
-        source_voice = run.paths.export_voice_best
-        source_meta = run.paths.export_dir / "voice_best_meta.json"
-        voice = torch.load(source_voice, map_location="cpu")
-        meta = json.loads(source_meta.read_text(encoding="utf-8"))
+        source_voice = ctx.paths.export("voice_best.pt")
+        source_meta = ctx.paths.export("voice_best_meta.json")
+        voice = load_pt(source_voice)
+        meta = read_json(source_meta)
     elif candidate == "final":
-        source_voice = run.paths.export_voice_final
-        source_meta = run.paths.export_dir / "voice_final_meta.json"
-        voice = torch.load(source_voice, map_location="cpu")
-        meta = json.loads(source_meta.read_text(encoding="utf-8"))
+        source_voice = ctx.paths.export("voice_final.pt")
+        source_meta = ctx.paths.export("voice_final_meta.json")
+        voice = load_pt(source_voice)
+        meta = read_json(source_meta)
     elif candidate == "best_optimization":
-        source_voice = run.paths.export_voice_best_optimization
-        source_meta = run.paths.export_dir / "voice_best_optimization_meta.json"
-        voice = torch.load(source_voice, map_location="cpu")
-        meta = json.loads(source_meta.read_text(encoding="utf-8"))
+        source_voice = ctx.paths.export("voice_best_optimization.pt")
+        source_meta = ctx.paths.export("voice_best_optimization_meta.json")
+        voice = load_pt(source_voice)
+        meta = read_json(source_meta)
     else:
-        voice, meta = _load_candidate_by_hash(run, candidate)
+        voice = _load_voice_by_hash(ctx, candidate)
+        meta = {
+            "selector": "voice_hash",
+            "voice_hash": candidate,
+            "note": "Explicit voice-hash export. See optimize/candidates and optimize/evaluations for records.",
+        }
 
-    voice_out = voice_out or run.paths.export_voice
-    meta_out = meta_out or run.paths.export_voice_meta
+    voice_out = voice_out or ctx.paths.export("voice.pt")
+    meta_out = meta_out or ctx.paths.export("voice_meta.json")
 
     save_voice(voice_out, voice)
-    save_json(meta_out, meta)
+    write_json(meta_out, meta)
     print(f"Exported voice: {voice_out}")
     print(f"Exported metadata: {meta_out}")
 
 
-def preview(run: Run, voice_path: Path | None = None) -> None:
-    voice_path = voice_path or run.paths.export_voice
+def preview(ctx: Context, voice_path: Path | None = None) -> None:
+    voice_path = voice_path or ctx.paths.export("voice.pt")
     if not voice_path.exists():
-        if run.paths.export_voice_best.exists():
-            voice_path = run.paths.export_voice_best
+        if ctx.paths.export("voice_best.pt").exists():
+            voice_path = ctx.paths.export("voice_best.pt")
         else:
             raise FileNotFoundError(
                 "No exported voice found; run optimize/export first"
             )
 
-    text_plan = load_text_plan(run)
+    text_plan = load_text_plan(ctx)
+    synthesizer = ctx.services.synthesizer()
+    voice = load_pt(voice_path)
 
-    from kokoro import KPipeline
-
-    pipeline = KPipeline(
-        lang_code=run.target.lang_code,
-        repo_id=run.assets.repo_id,
-        device=run.device,
-    )
-    synthesizer = KokoroSynthesizer(pipeline, sample_rate=run.audio.kokoro_sample_rate)
-    voice = torch.load(voice_path, map_location="cpu")
-
-    run.paths.preview_dir.mkdir(parents=True, exist_ok=True)
+    ctx.paths.preview_dir.mkdir(parents=True, exist_ok=True)
     for idx, text in enumerate(text_plan.validation_texts):
         audio = synthesizer.synthesize(text, voice)
-        wav_path = run.paths.preview_dir / f"preview_{idx:02d}.wav"
-        json_path = run.paths.preview_dir / f"preview_{idx:02d}.json"
+        wav_path = ctx.paths.preview(f"preview_{idx:02d}.wav")
+        json_path = ctx.paths.preview(f"preview_{idx:02d}.json")
         torchaudio.save(
             str(wav_path),
             audio.cpu().to(torch.float32).unsqueeze(0),
             synthesizer.sample_rate,
         )
-        save_json(
+        write_json(
             json_path,
             {
                 "text": text,
@@ -293,4 +300,4 @@ def preview(run: Run, voice_path: Path | None = None) -> None:
             },
         )
 
-    print(f"Wrote previews to {run.paths.preview_dir}")
+    print(f"Wrote previews to {ctx.paths.preview_dir}")

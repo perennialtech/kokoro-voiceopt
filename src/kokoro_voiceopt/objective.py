@@ -8,11 +8,11 @@ import torch.nn.functional as F
 
 from .audio import generated_audio_metrics, preprocess_generated_audio
 from .config import AudioConfig, ObjectiveConfig
-from .data import normalize_text
 from .manifold import VoiceManifold
 from .profile import TargetSpeakerProfile
 from .speaker import SpeakerEncoder
 from .synth import KokoroSynthesizer
+from .transcript import normalize_text
 
 
 @dataclass
@@ -29,6 +29,7 @@ class CandidateEval:
     bound_loss: float
     audio_quality_loss: float
     mean_similarity: float
+    include_latent_penalties: bool
     per_text: list[dict]
 
     def to_dict(self) -> dict:
@@ -39,6 +40,7 @@ class CandidateEval:
             "bound_loss": self.bound_loss,
             "audio_quality_loss": self.audio_quality_loss,
             "mean_similarity": self.mean_similarity,
+            "include_latent_penalties": self.include_latent_penalties,
             "per_text": self.per_text,
         }
 
@@ -67,6 +69,8 @@ class VoiceObjective:
         voices: list[torch.Tensor],
         texts: list[str],
         latent_info: list[LatentInfo | None] | None = None,
+        *,
+        include_latent_penalties: bool = True,
     ) -> list[CandidateEval]:
         if not voices:
             return []
@@ -105,7 +109,9 @@ class VoiceObjective:
                         audio, self.synthesizer.sample_rate
                     )
                     processed = preprocess_generated_audio(
-                        audio, self.synthesizer.sample_rate, self.audio_config
+                        audio,
+                        self.synthesizer.sample_rate,
+                        self.audio_config,
                     )
 
                     if processed.numel() < int(
@@ -142,7 +148,11 @@ class VoiceObjective:
             duration_losses: list[float] = []
             invalid_losses: list[float] = []
 
-            for item in [g for g in generated if g["voice_idx"] == voice_idx]:
+            for item in [
+                generated_item
+                for generated_item in generated
+                if generated_item["voice_idx"] == voice_idx
+            ]:
                 if not item["valid"]:
                     per_text.append(
                         {
@@ -158,14 +168,14 @@ class VoiceObjective:
                             "silence_ratio": None,
                             "clip_ratio": None,
                             "similarity": -1.0,
-                            "speaker_loss": self.config.invalid_audio_loss,
+                            "speaker_loss": 1.0,
                             "silence_loss": 0.0,
                             "clipping_loss": 0.0,
                             "duration_loss": 0.0,
                             "quality_loss": self.config.invalid_audio_loss,
                         }
                     )
-                    speaker_losses.append(self.config.invalid_audio_loss)
+                    speaker_losses.append(1.0)
                     similarities.append(-1.0)
                     invalid_losses.append(self.config.invalid_audio_loss)
                     continue
@@ -248,7 +258,7 @@ class VoiceObjective:
             prior_loss = 0.0
             bound_loss = 0.0
             info = latent_info[voice_idx]
-            if info is not None:
+            if include_latent_penalties and info is not None:
                 z = info.z.detach().cpu()
                 prior_loss = float(info.manifold.prior_loss(z))
                 bound_loss = float(info.manifold.soft_bound_loss(z))
@@ -275,6 +285,7 @@ class VoiceObjective:
                     bound_loss=float(bound_loss),
                     audio_quality_loss=float(audio_quality_loss),
                     mean_similarity=float(mean_similarity),
+                    include_latent_penalties=include_latent_penalties,
                     per_text=per_text,
                 )
             )
