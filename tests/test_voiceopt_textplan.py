@@ -1,6 +1,6 @@
 import pytest
-from kokoro.voiceopt.config import TextConfig
-from kokoro.voiceopt.textplan import (build_text_plan, load_validation_texts,
+from kokoro_voiceopt.config import TextConfig
+from kokoro_voiceopt.textplan import (build_text_plan, load_validation_texts,
                                       split_transcript_sentences)
 
 

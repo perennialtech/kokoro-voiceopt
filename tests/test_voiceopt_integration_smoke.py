@@ -2,11 +2,11 @@ import os
 from pathlib import Path
 
 import pytest
-from kokoro.voiceopt.config import (AudioConfig, CorpusConfig, ManifoldConfig,
+from kokoro_voiceopt.config import (AudioConfig, CorpusConfig, ManifoldConfig,
                                     OutputConfig, SpeakerConfig, TextConfig,
                                     VoiceOptConfig)
-from kokoro.voiceopt.corpus import VoiceCorpus
-from kokoro.voiceopt.manifold import VoiceManifold
+from kokoro_voiceopt.corpus import VoiceCorpus
+from kokoro_voiceopt.manifold import VoiceManifold
 
 
 @pytest.mark.skipif(

@@ -9,11 +9,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from kokoro.voiceopt.config import (AudioConfig, CorpusConfig, ManifoldConfig,
+from kokoro_voiceopt.config import (AudioConfig, CorpusConfig, ManifoldConfig,
                                     ObjectiveConfig, OutputConfig,
                                     SearchConfig, SpeakerConfig, TextConfig,
                                     VoiceOptConfig)
-from kokoro.voiceopt.pipeline import VoiceOptimizationPipeline
+from kokoro_voiceopt.pipeline import VoiceOptimizationPipeline
 
 
 def main() -> None:

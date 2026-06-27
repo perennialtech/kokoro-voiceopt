@@ -33,3 +33,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
+
+[build-system]
+requires = ["setuptools>=81", "wheel"]
+build-backend = "setuptools.build_meta"

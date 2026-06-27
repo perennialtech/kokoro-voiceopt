@@ -1,7 +1,7 @@
 import torch
-from kokoro.voiceopt.config import ManifoldConfig
-from kokoro.voiceopt.corpus import VoiceCorpus, VoiceRecord
-from kokoro.voiceopt.manifold import VoiceManifold
+from kokoro_voiceopt.config import ManifoldConfig
+from kokoro_voiceopt.corpus import VoiceCorpus, VoiceRecord
+from kokoro_voiceopt.manifold import VoiceManifold
 
 
 def _corpus():

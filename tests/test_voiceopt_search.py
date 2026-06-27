@@ -1,7 +1,7 @@
 import torch
-from kokoro.voiceopt.config import SearchConfig
-from kokoro.voiceopt.objective import CandidateEval
-from kokoro.voiceopt.search import AntitheticNES, voice_hash
+from kokoro_voiceopt.config import SearchConfig
+from kokoro_voiceopt.objective import CandidateEval
+from kokoro_voiceopt.search import AntitheticNES, voice_hash
 
 
 def _eval(loss):

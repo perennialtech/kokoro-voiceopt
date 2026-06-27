@@ -1,6 +1,6 @@
 import pytest
 import torch
-from kokoro.voiceopt.corpus import canonicalize_voice_tensor
+from kokoro_voiceopt.corpus import canonicalize_voice_tensor
 
 
 def test_canonicalize_2d_voice():
