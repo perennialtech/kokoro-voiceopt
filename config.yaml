@@ -42,7 +42,7 @@ data:
 speaker_encoder:
   backend: wavlm_xvector
   model_name: microsoft/wavlm-base-plus-sv
-  batch_size: 16
+  batch_size: 8
   normalize_embeddings: true
 
 text:
