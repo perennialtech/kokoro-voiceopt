@@ -10,6 +10,7 @@ target:
 
 assets:
   repo_id: hexgrad/Kokoro-82M
+  trt_artifact_dir: trt_artifacts
   voices_dir: assets/kokoro/voices
   prepared_corpus_dir: runs/my_speaker/corpus
   voice_names: null

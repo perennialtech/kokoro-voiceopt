@@ -60,6 +60,7 @@ class SpeakerEncoderConfig:
 @dataclass(frozen=True)
 class VoiceCorpusConfig:
     repo_id: str = "hexgrad/Kokoro-82M"
+    trt_artifact_dir: Path | None = None
     voices_dir: Path | None = None
     prepared_corpus_dir: Path | None = None
     voice_names: tuple[str, ...] | None = None
@@ -249,12 +250,18 @@ class Context:
         )
 
         assets_raw = dict(raw.get("assets", {}))
+        trt_artifact_dir = assets_raw.get("trt_artifact_dir")
         voices_dir = assets_raw.get("voices_dir")
         prepared_corpus_dir = assets_raw.get("prepared_corpus_dir")
         voice_names = assets_raw.get("voice_names")
 
         assets = VoiceCorpusConfig(
             repo_id=str(assets_raw.get("repo_id", "hexgrad/Kokoro-82M")),
+            trt_artifact_dir=(
+                resolve_path(project_root_path, trt_artifact_dir)
+                if trt_artifact_dir
+                else None
+            ),
             voices_dir=(
                 resolve_path(project_root_path, voices_dir) if voices_dir else None
             ),

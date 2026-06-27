@@ -6,25 +6,10 @@ from .voice import as_kokoro_voice
 
 
 class KokoroSynthesizer:
-    def __init__(self, pipeline, sample_rate: int = 24000):
-        self.pipeline = pipeline
+    def __init__(self, tts, sample_rate: int = 24000, lang_code: str = "a"):
+        self.tts = tts
         self.sample_rate = sample_rate
-
-    def _model_device(self) -> torch.device:
-        model = getattr(self.pipeline, "model", None)
-        device = getattr(model, "device", None)
-        if device is not None:
-            return torch.device(device)
-
-        if model is not None:
-            try:
-                return next(model.parameters()).device
-            except StopIteration:
-                pass
-            except AttributeError:
-                pass
-
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.lang_code = lang_code
 
     def synthesize(
         self,
@@ -35,11 +20,15 @@ class KokoroSynthesizer:
         if not text or not text.strip():
             raise ValueError("Cannot synthesize empty text")
 
-        kokoro_voice = as_kokoro_voice(voice).to(self._model_device())
+        kokoro_voice = as_kokoro_voice(voice).to(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
         chunks: list[torch.Tensor] = []
 
         with torch.no_grad():
-            for result in self.pipeline(text=text, voice=kokoro_voice, speed=speed):
+            for result in self.tts.synthesize(
+                text=text, voice=kokoro_voice, language=self.lang_code, speed=speed
+            ):
                 audio = getattr(result, "audio", None)
                 if audio is None:
                     continue

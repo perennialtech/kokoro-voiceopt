@@ -10,3 +10,5 @@ wheels/
 .venv
 
 *.wav
+
+trt_artifacts

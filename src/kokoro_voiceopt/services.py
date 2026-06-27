@@ -13,13 +13,14 @@ def make_speaker_encoder(ctx: Context):
 
 
 def make_kokoro_pipeline(ctx: Context):
-    from kokoro import KPipeline
+    from kokoro import KokoroTRT
 
-    return KPipeline(
-        lang_code=ctx.cfg.target.lang_code,
-        repo_id=ctx.cfg.assets.repo_id,
-        device=ctx.cfg.device,
-    )
+    if not ctx.cfg.assets.trt_artifact_dir:
+        raise ValueError(
+            "trt_artifact_dir must be configured in assets to use TensorRT Kokoro"
+        )
+
+    return KokoroTRT(str(ctx.cfg.assets.trt_artifact_dir))
 
 
 def make_synthesizer(ctx: Context):
@@ -28,4 +29,5 @@ def make_synthesizer(ctx: Context):
     return KokoroSynthesizer(
         make_kokoro_pipeline(ctx),
         sample_rate=ctx.cfg.audio.kokoro_sample_rate,
+        lang_code=ctx.cfg.target.lang_code,
     )
