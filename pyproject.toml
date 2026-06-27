@@ -12,6 +12,7 @@ dependencies = [
     "soundfile>=0.14.0",
     "torch>=2.12.1",
     "torchaudio>=2.11.0",
+    "torchvision>=0.27.1",
     "tqdm>=4.68.3",
     "transformers>=5.12.1",
 ]
@@ -36,6 +37,7 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 kokoro = { git = "https://github.com/perennialtech/kokoro" }
 
 [build-system]
