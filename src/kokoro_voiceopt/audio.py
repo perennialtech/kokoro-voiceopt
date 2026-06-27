@@ -1,26 +1,12 @@
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import torch
 import torchaudio
 
 from .config import AudioConfig
-
-
-@dataclass
-class AudioSegment:
-    waveform: torch.Tensor
-    sample_rate: int
-    start_sample: int
-    end_sample: int
-
-    @property
-    def duration_seconds(self) -> float:
-        return (self.end_sample - self.start_sample) / float(self.sample_rate)
 
 
 @dataclass
@@ -52,20 +38,58 @@ def remove_dc_offset(audio: torch.Tensor) -> torch.Tensor:
     return audio - audio.mean()
 
 
-def peak_normalize(audio: torch.Tensor, peak: float = 0.95) -> torch.Tensor:
+def peak_normalize(audio: torch.Tensor, peak: float = 0.98) -> torch.Tensor:
     if audio.numel() == 0:
         return audio
     current = audio.abs().max()
     if current <= 1e-8:
         return audio
-    return audio * (peak / current)
+    return audio * (float(peak) / current)
 
 
 def resample_audio(audio: torch.Tensor, orig_sr: int, new_sr: int) -> torch.Tensor:
     if orig_sr == new_sr:
         return audio.to(torch.float32).contiguous()
-    resampler = torchaudio.transforms.Resample(orig_freq=orig_sr, new_freq=new_sr)
-    return resampler(audio.cpu()).to(torch.float32).contiguous()
+    return (
+        torchaudio.functional.resample(
+            audio.to(torch.float32).unsqueeze(0), orig_sr, new_sr
+        )
+        .squeeze(0)
+        .contiguous()
+    )
+
+
+def trim_edges(
+    audio: torch.Tensor,
+    sample_rate: int,
+    threshold: float,
+    pad_ms: int,
+    enabled: bool = True,
+) -> torch.Tensor:
+    audio = to_mono(audio).to(torch.float32)
+    if not enabled or audio.numel() == 0:
+        return audio.contiguous()
+
+    mask = audio.abs() > float(threshold)
+    if not mask.any():
+        return audio.contiguous()
+
+    active = torch.nonzero(mask, as_tuple=False).flatten()
+    pad = int(sample_rate * pad_ms / 1000)
+    start = max(0, int(active[0]) - pad)
+    end = min(int(audio.numel()), int(active[-1]) + pad + 1)
+    return audio[start:end].contiguous()
+
+
+def apply_fades(audio: torch.Tensor, sample_rate: int, fade_ms: int) -> torch.Tensor:
+    n = min(int(sample_rate * fade_ms / 1000), audio.numel() // 2)
+    if n <= 1:
+        return audio.contiguous()
+
+    audio = audio.clone()
+    audio[:n] *= torch.linspace(0, 1, n, dtype=audio.dtype)
+    audio[-n:] *= torch.linspace(1, 0, n, dtype=audio.dtype)
+    return audio.contiguous()
 
 
 def preprocess_waveform(audio: torch.Tensor, config: AudioConfig) -> torch.Tensor:
@@ -73,162 +97,8 @@ def preprocess_waveform(audio: torch.Tensor, config: AudioConfig) -> torch.Tenso
     if config.dc_remove:
         audio = remove_dc_offset(audio)
     if config.peak_normalize:
-        audio = peak_normalize(audio)
+        audio = peak_normalize(audio, peak=config.max_peak)
     return audio.contiguous()
-
-
-def load_target_audio(
-    path: str | Path, config: AudioConfig
-) -> tuple[torch.Tensor, int]:
-    audio, sample_rate = load_audio(path)
-    audio = preprocess_waveform(audio, config)
-    audio = resample_audio(audio, sample_rate, config.speaker_sample_rate)
-    return audio.contiguous(), config.speaker_sample_rate
-
-
-def _load_silero_get_timestamps() -> Callable | None:
-    try:
-        from silero_vad import get_speech_timestamps, load_silero_vad
-
-        model = load_silero_vad()
-
-        def detect(audio: torch.Tensor, sample_rate: int):
-            return get_speech_timestamps(
-                audio, model, sampling_rate=sample_rate, return_seconds=False
-            )
-
-        return detect
-    except Exception:
-        pass
-
-    try:
-        model, utils = torch.hub.load(
-            repo_or_dir="snakers4/silero-vad",
-            model="silero_vad",
-            trust_repo=True,
-            verbose=False,
-        )
-        get_speech_timestamps = utils[0]
-
-        def detect(audio: torch.Tensor, sample_rate: int):
-            return get_speech_timestamps(
-                audio, model, sampling_rate=sample_rate, return_seconds=False
-            )
-
-        return detect
-    except Exception as exc:
-        warnings.warn(f"Silero VAD unavailable; falling back to energy VAD: {exc}")
-        return None
-
-
-def _energy_vad(audio: torch.Tensor, sample_rate: int) -> list[dict[str, int]]:
-    if audio.numel() == 0:
-        return []
-
-    frame = max(1, int(0.03 * sample_rate))
-    hop = max(1, int(0.01 * sample_rate))
-    padded = torch.nn.functional.pad(audio.abs(), (0, frame))
-    frames = padded.unfold(0, frame, hop)
-    energy = frames.mean(dim=-1)
-
-    threshold = max(float(energy.mean() * 0.5), 1e-4)
-    voiced = energy > threshold
-
-    regions: list[dict[str, int]] = []
-    start = None
-    for idx, is_voiced in enumerate(voiced.tolist()):
-        if is_voiced and start is None:
-            start = idx * hop
-        elif not is_voiced and start is not None:
-            end = min(idx * hop + frame, audio.numel())
-            regions.append({"start": start, "end": end})
-            start = None
-
-    if start is not None:
-        regions.append({"start": start, "end": audio.numel()})
-
-    return regions
-
-
-def detect_speech_regions(
-    audio: torch.Tensor, sample_rate: int, config: AudioConfig
-) -> list[dict[str, int]]:
-    if config.vad_model.lower() == "silero":
-        detector = _load_silero_get_timestamps()
-        if detector is not None:
-            regions = detector(audio.cpu(), sample_rate)
-            return [{"start": int(r["start"]), "end": int(r["end"])} for r in regions]
-
-    return _energy_vad(audio.cpu(), sample_rate)
-
-
-def segment_target_speech(
-    audio: torch.Tensor, sample_rate: int, config: AudioConfig
-) -> list[AudioSegment]:
-    regions = detect_speech_regions(audio, sample_rate, config)
-    if not regions:
-        regions = [{"start": 0, "end": int(audio.numel())}]
-
-    min_samples = int(config.min_segment_seconds * sample_rate)
-    max_samples = int(config.max_segment_seconds * sample_rate)
-
-    segments: list[AudioSegment] = []
-    for region in regions:
-        start = max(0, int(region["start"]))
-        end = min(int(audio.numel()), int(region["end"]))
-        if end <= start:
-            continue
-
-        cursor = start
-        while cursor < end:
-            chunk_end = min(cursor + max_samples, end)
-            if chunk_end - cursor >= min_samples:
-                segments.append(
-                    AudioSegment(
-                        waveform=audio[cursor:chunk_end].contiguous(),
-                        sample_rate=sample_rate,
-                        start_sample=cursor,
-                        end_sample=chunk_end,
-                    )
-                )
-            cursor = chunk_end
-
-    if not segments and audio.numel() > 0:
-        segments = [
-            AudioSegment(
-                waveform=audio.contiguous(),
-                sample_rate=sample_rate,
-                start_sample=0,
-                end_sample=int(audio.numel()),
-            )
-        ]
-
-    segments.sort(key=lambda s: s.duration_seconds, reverse=True)
-    segments = segments[: config.max_target_segments]
-    segments.sort(key=lambda s: s.start_sample)
-    return segments
-
-
-def trim_generated_audio(
-    audio: torch.Tensor, sample_rate: int, enabled: bool = True
-) -> torch.Tensor:
-    audio = to_mono(audio).to(torch.float32)
-    if not enabled or audio.numel() == 0:
-        return audio.contiguous()
-
-    peak = float(audio.abs().max())
-    if peak <= 1e-8:
-        return audio.contiguous()
-
-    threshold = max(peak * 0.01, 1e-4)
-    active = torch.nonzero(audio.abs() > threshold).flatten()
-    if active.numel() == 0:
-        return audio.contiguous()
-
-    margin = int(0.05 * sample_rate)
-    start = max(0, int(active[0]) - margin)
-    end = min(int(audio.numel()), int(active[-1]) + margin + 1)
-    return audio[start:end].contiguous()
 
 
 def generated_audio_metrics(
@@ -255,7 +125,17 @@ def generated_audio_metrics(
 def preprocess_generated_audio(
     audio: torch.Tensor, sample_rate: int, config: AudioConfig
 ) -> torch.Tensor:
-    audio = preprocess_waveform(audio, config)
-    audio = trim_generated_audio(audio, sample_rate, config.trim_silence)
-    audio = resample_audio(audio, sample_rate, config.speaker_sample_rate)
+    audio = to_mono(audio).to(torch.float32)
+    if config.dc_remove:
+        audio = remove_dc_offset(audio)
+    if config.peak_normalize:
+        audio = peak_normalize(audio, peak=config.max_peak)
+    audio = trim_edges(
+        audio,
+        sample_rate,
+        threshold=config.trim_threshold,
+        pad_ms=config.trim_pad_ms,
+        enabled=config.trim_edges,
+    )
+    audio = resample_audio(audio, sample_rate, config.target_sample_rate)
     return audio.contiguous()

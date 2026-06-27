@@ -15,7 +15,7 @@ except ImportError as exc:  # pragma: no cover
 else:
     _TRANSFORMERS_IMPORT_ERROR = None
 
-from .config import SpeakerConfig
+from .config import SpeakerEncoderConfig
 
 
 class SpeakerEncoder(ABC):
@@ -26,13 +26,16 @@ class SpeakerEncoder(ABC):
     def encode_batch(
         self, audios: list[torch.Tensor], sample_rates: list[int]
     ) -> torch.Tensor:
-        """Return L2-normalized speaker embeddings shaped [batch, speaker_dim]."""
+        """Return speaker embeddings shaped [batch, speaker_dim]."""
 
 
 class WavLMXVectorSpeakerEncoder(SpeakerEncoder):
     sample_rate = 16000
 
-    def __init__(self, config: SpeakerConfig, device: str):
+    def __init__(self, config: SpeakerEncoderConfig, device: str):
+        if config.backend != "wavlm_xvector":
+            raise ValueError(f"Unsupported speaker encoder backend: {config.backend}")
+
         if _TRANSFORMERS_IMPORT_ERROR is not None:  # pragma: no cover
             raise ImportError(
                 "Install transformers to use WavLM speaker encoding"
@@ -85,7 +88,7 @@ class WavLMXVectorSpeakerEncoder(SpeakerEncoder):
                 padding=True,
                 return_attention_mask=True,
             )
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
 
             model_outputs = self.model(**inputs)
             embeddings = model_outputs.embeddings

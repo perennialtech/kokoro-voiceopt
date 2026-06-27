@@ -1,20 +1,23 @@
 [project]
 name = "kokoro-voiceopt"
 version = "0.1.0"
-description = "Add your description here"
+description = "Black-box Kokoro voice optimization"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "huggingface-hub>=1.21.0",
     "kokoro>=0.9.4",
-    "misaki[en]>=0.9.4",
     "numpy>=2.4.6",
-    "silero-vad>=6.2.1",
+    "pyyaml>=6.0.3",
+    "soundfile>=0.14.0",
     "torch>=2.12.1",
     "torchaudio>=2.11.0",
     "tqdm>=4.68.3",
     "transformers>=5.12.1",
 ]
+
+[project.scripts]
+kokoro-voiceopt = "kokoro_voiceopt.cli:main"
 
 [dependency-groups]
 dev = [

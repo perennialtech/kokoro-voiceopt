@@ -1,0 +1,93 @@
+schema_version: 1
+
+run:
+  id: my_speaker
+  root: runs/my_speaker
+
+target:
+  id: my_speaker
+  lang_code: a
+
+assets:
+  repo_id: hexgrad/Kokoro-82M
+  voices_dir: assets/kokoro/voices
+  prepared_corpus_dir: runs/my_speaker/corpus
+  voice_names: null
+  include_cross_language_voices: true
+  require_consistent_shape: true
+  dtype: float32
+
+audio:
+  target_sample_rate: 16000
+  kokoro_sample_rate: 24000
+  trim_edges: true
+  trim_threshold: 0.015
+  trim_pad_ms: 120
+  fade_ms: 8
+  dc_remove: true
+  peak_normalize: true
+  max_peak: 0.98
+
+data:
+  min_duration_s: 1.5
+  max_duration_s: 12.0
+  min_total_duration_s: 20.0
+  min_target_clips: 1
+  max_target_clips: 24
+  max_clip_ratio: 0.0001
+  hard_end_threshold: 0.2
+  require_spoken_form: true
+  seed: 42
+
+speaker_encoder:
+  backend: wavlm_xvector
+  model_name: microsoft/wavlm-base-plus-sv
+  batch_size: 16
+  normalize_embeddings: true
+
+text:
+  max_optimization_texts: 3
+  max_validation_texts: 6
+  min_text_chars: 20
+  max_text_chars: 220
+  validation_texts_path: null
+
+manifold:
+  center: median
+  max_latent_dim: 32
+  variance_coverage: 0.98
+  z_soft_bound: 2.5
+  z_hard_bound: 4.0
+  save_manifold: true
+
+objective:
+  speaker_loss_weight: 1.0
+  prior_loss_weight: 0.02
+  bound_loss_weight: 0.10
+  silence_loss_weight: 0.05
+  clipping_loss_weight: 0.10
+  duration_loss_weight: 0.02
+  max_silence_ratio: 0.25
+  max_clip_ratio: 0.001
+  invalid_audio_loss: 100.0
+
+search:
+  seed: 1234
+  top_k_for_blend: 8
+  blend_iterations: 60
+  blend_population_pairs: 8
+  blend_sigma_initial: 0.75
+  blend_sigma_final: 0.15
+  blend_learning_rate: 0.08
+  latent_iterations: 180
+  latent_population_pairs: 12
+  latent_sigma_initial: 0.35
+  latent_sigma_final: 0.06
+  latent_learning_rate: 0.04
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_eps: 1.0e-8
+  save_every: 10
+  validate_every: 20
+
+device: cuda

@@ -8,7 +8,6 @@ from typing import Any
 import torch
 import torchaudio
 
-from .objective import TargetSpeakerProfile
 from .search import Candidate
 from .synth import KokoroSynthesizer, to_kokoro_voice
 
@@ -41,25 +40,6 @@ def save_pt(path: str | Path, data: Any) -> None:
     torch.save(data, path)
 
 
-def save_target_profile(output_dir: str | Path, profile: TargetSpeakerProfile) -> None:
-    output_dir = Path(output_dir)
-    save_pt(
-        output_dir / "target_profile.pt",
-        {
-            "embedding": profile.embedding.cpu().to(torch.float32).contiguous(),
-            "segment_embeddings": profile.segment_embeddings.cpu()
-            .to(torch.float32)
-            .contiguous(),
-            "segment_durations": profile.segment_durations,
-            "source_sample_rate": profile.source_sample_rate,
-            "total_speech_seconds": profile.total_speech_seconds,
-            "total_audio_seconds": profile.total_audio_seconds,
-            "audio_path": str(profile.audio_path),
-        },
-    )
-    save_json(output_dir / "target_profile.json", profile.to_json())
-
-
 def save_voice(path: str | Path, voice: torch.Tensor) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,8 +53,6 @@ def save_voice(path: str | Path, voice: torch.Tensor) -> None:
         raise ValueError(
             f"Saved voice must be [T,1,256], got {tuple(kokoro_voice.shape)}"
         )
-    if not kokoro_voice.is_contiguous():
-        kokoro_voice = kokoro_voice.contiguous()
 
     torch.save(kokoro_voice, path)
 

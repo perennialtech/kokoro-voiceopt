@@ -1,4 +1,5 @@
 import torch
+
 from kokoro_voiceopt.config import SearchConfig
 from kokoro_voiceopt.objective import CandidateEval
 from kokoro_voiceopt.search import AntitheticNES, voice_hash

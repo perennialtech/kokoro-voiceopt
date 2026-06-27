@@ -2,39 +2,17 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import torch.nn.functional as F
 
-from .audio import (generated_audio_metrics, load_target_audio,
-                    preprocess_generated_audio, segment_target_speech)
+from .audio import generated_audio_metrics, preprocess_generated_audio
 from .config import AudioConfig, ObjectiveConfig
+from .data import normalize_text
 from .manifold import VoiceManifold
+from .profile import TargetSpeakerProfile
 from .speaker import SpeakerEncoder
 from .synth import KokoroSynthesizer
-
-
-@dataclass
-class TargetSpeakerProfile:
-    embedding: torch.Tensor
-    segment_embeddings: torch.Tensor
-    segment_durations: list[float]
-    source_sample_rate: int
-    total_speech_seconds: float
-    total_audio_seconds: float
-    audio_path: Path
-
-    def to_json(self) -> dict:
-        return {
-            "audio_path": str(self.audio_path),
-            "source_sample_rate": self.source_sample_rate,
-            "num_segments": len(self.segment_durations),
-            "segment_durations": self.segment_durations,
-            "total_speech_seconds": self.total_speech_seconds,
-            "total_audio_seconds": self.total_audio_seconds,
-            "embedding_dim": int(self.embedding.numel()),
-        }
 
 
 @dataclass
@@ -65,38 +43,6 @@ class CandidateEval:
         }
 
 
-def build_target_speaker_profile(
-    audio_path: str | Path,
-    audio_config: AudioConfig,
-    speaker_encoder: SpeakerEncoder,
-) -> TargetSpeakerProfile:
-    path = Path(audio_path)
-    audio, sample_rate = load_target_audio(path, audio_config)
-    segments = segment_target_speech(audio, sample_rate, audio_config)
-    if not segments:
-        raise ValueError("Target audio produced no usable speech segments")
-
-    embeddings = speaker_encoder.encode_batch(
-        [segment.waveform for segment in segments],
-        [segment.sample_rate for segment in segments],
-    )
-    embeddings = F.normalize(embeddings, dim=-1)
-    profile_embedding = F.normalize(embeddings.mean(dim=0), dim=0)
-
-    total_speech = sum(segment.duration_seconds for segment in segments)
-    total_audio = audio.numel() / float(sample_rate)
-
-    return TargetSpeakerProfile(
-        embedding=profile_embedding.cpu().contiguous(),
-        segment_embeddings=embeddings.cpu().contiguous(),
-        segment_durations=[segment.duration_seconds for segment in segments],
-        source_sample_rate=sample_rate,
-        total_speech_seconds=total_speech,
-        total_audio_seconds=total_audio,
-        audio_path=path,
-    )
-
-
 class VoiceObjective:
     def __init__(
         self,
@@ -111,6 +57,10 @@ class VoiceObjective:
         self.target_profile = target_profile
         self.audio_config = audio_config
         self.config = objective_config
+
+    def expected_duration(self, normalized_text: str) -> float:
+        rate = max(float(self.target_profile.speech_rate_chars_per_second), 1e-6)
+        return max(len(normalized_text) / rate, 0.25)
 
     def evaluate_voices(
         self,
@@ -128,16 +78,21 @@ class VoiceObjective:
         if len(latent_info) != len(voices):
             raise ValueError("latent_info must be None or have one item per voice")
 
+        normalized_texts = [normalize_text(text) for text in texts]
+
         generated: list[dict] = []
         encode_audios: list[torch.Tensor] = []
         encode_rates: list[int] = []
 
         for voice_idx, voice in enumerate(voices):
             for text_idx, text in enumerate(texts):
+                normalized = normalized_texts[text_idx]
                 item = {
                     "voice_idx": voice_idx,
                     "text_idx": text_idx,
                     "text": text,
+                    "normalized_text": normalized,
+                    "expected_duration_seconds": self.expected_duration(normalized),
                     "valid": False,
                     "embedding_index": None,
                     "error": None,
@@ -154,7 +109,7 @@ class VoiceObjective:
                     )
 
                     if processed.numel() < int(
-                        0.05 * self.audio_config.speaker_sample_rate
+                        0.05 * self.audio_config.target_sample_rate
                     ):
                         raise RuntimeError(
                             "Generated audio too short after preprocessing"
@@ -164,8 +119,7 @@ class VoiceObjective:
                     item["metrics"] = metrics
                     item["embedding_index"] = len(encode_audios)
                     encode_audios.append(processed)
-                    encode_rates.append(self.audio_config.speaker_sample_rate)
-
+                    encode_rates.append(self.audio_config.target_sample_rate)
                 except Exception as exc:
                     item["error"] = str(exc)
 
@@ -177,10 +131,6 @@ class VoiceObjective:
             embeddings = F.normalize(embeddings, dim=-1)
 
         target = self.target_profile.embedding.cpu()
-        target_duration_per_text = max(
-            self.target_profile.total_speech_seconds / max(len(texts), 1),
-            1e-6,
-        )
 
         results: list[CandidateEval] = []
         for voice_idx in range(len(voices)):
@@ -197,10 +147,21 @@ class VoiceObjective:
                     per_text.append(
                         {
                             "text": item["text"],
+                            "normalized_text": item["normalized_text"],
+                            "expected_duration_seconds": item[
+                                "expected_duration_seconds"
+                            ],
+                            "actual_duration_seconds": None,
                             "valid": False,
                             "error": item["error"],
-                            "speaker_loss": self.config.invalid_audio_loss,
+                            "peak": None,
+                            "silence_ratio": None,
+                            "clip_ratio": None,
                             "similarity": -1.0,
+                            "speaker_loss": self.config.invalid_audio_loss,
+                            "silence_loss": 0.0,
+                            "clipping_loss": 0.0,
+                            "duration_loss": 0.0,
                             "quality_loss": self.config.invalid_audio_loss,
                         }
                     )
@@ -221,9 +182,8 @@ class VoiceObjective:
                     max(0.0, metrics.clip_ratio - self.config.max_clip_ratio) ** 2
                 )
 
-                duration_ratio = (
-                    max(metrics.duration_seconds, 1e-6) / target_duration_per_text
-                )
+                expected_duration = float(item["expected_duration_seconds"])
+                duration_ratio = max(metrics.duration_seconds, 1e-6) / expected_duration
                 duration_margin = math.log(1.6)
                 duration_loss = (
                     max(0.0, abs(math.log(duration_ratio)) - duration_margin) ** 2
@@ -238,12 +198,16 @@ class VoiceObjective:
                 per_text.append(
                     {
                         "text": item["text"],
+                        "normalized_text": item["normalized_text"],
+                        "expected_duration_seconds": expected_duration,
+                        "actual_duration_seconds": metrics.duration_seconds,
                         "valid": True,
-                        "similarity": similarity,
-                        "speaker_loss": speaker_loss,
+                        "error": None,
+                        "peak": metrics.peak,
                         "silence_ratio": metrics.silence_ratio,
                         "clip_ratio": metrics.clip_ratio,
-                        "duration_seconds": metrics.duration_seconds,
+                        "similarity": similarity,
+                        "speaker_loss": speaker_loss,
                         "silence_loss": silence_loss,
                         "clipping_loss": clipping_loss,
                         "duration_loss": duration_loss,
@@ -260,7 +224,6 @@ class VoiceObjective:
 
             speaker_loss = float(sum(speaker_losses) / max(len(speaker_losses), 1))
             mean_similarity = float(sum(similarities) / max(len(similarities), 1))
-
             silence_loss = (
                 float(sum(silence_losses) / max(len(silence_losses), 1))
                 if silence_losses

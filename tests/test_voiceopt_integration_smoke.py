@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 
 import pytest
+
 from kokoro_voiceopt.config import (AudioConfig, CorpusConfig, ManifoldConfig,
                                     OutputConfig, SpeakerConfig, TextConfig,
                                     VoiceOptConfig)

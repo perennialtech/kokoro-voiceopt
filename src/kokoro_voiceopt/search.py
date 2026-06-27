@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -11,7 +13,6 @@ from tqdm import tqdm
 
 from .config import SearchConfig
 from .corpus import VoiceCorpus
-from .manifold import VoiceManifold
 from .objective import CandidateEval, LatentInfo, VoiceObjective
 
 
@@ -24,6 +25,7 @@ class Candidate:
     iteration: int | None
     created_at: str
     candidate_hash: str
+    metadata: dict
 
     def to_dict(self) -> dict:
         return {
@@ -35,6 +37,7 @@ class Candidate:
                 list(self.params.shape) if self.params is not None else None
             ),
             "voice_shape": list(self.voice.shape),
+            "metadata": self.metadata,
             "eval": self.eval.to_dict(),
         }
 
@@ -101,6 +104,7 @@ def make_candidate(
     eval_result: CandidateEval,
     params: torch.Tensor | None = None,
     iteration: int | None = None,
+    metadata: dict | None = None,
 ) -> Candidate:
     voice = voice.detach().cpu().to(torch.float32).contiguous()
     params = (
@@ -114,6 +118,58 @@ def make_candidate(
         iteration=iteration,
         created_at=_now(),
         candidate_hash=voice_hash(voice),
+        metadata=dict(metadata or {}),
+    )
+
+
+def save_candidate_artifacts(candidate: Candidate, candidate_dir: str | Path) -> None:
+    candidate_dir = Path(candidate_dir)
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    base = candidate_dir / candidate.candidate_hash
+
+    with open(base.with_suffix(".json"), "w", encoding="utf-8") as file:
+        json.dump(candidate.to_dict(), file, indent=2, ensure_ascii=False)
+
+    torch.save(
+        {
+            "voice": candidate.voice.cpu().to(torch.float32).contiguous(),
+            "params": (
+                None
+                if candidate.params is None
+                else candidate.params.cpu().to(torch.float32).contiguous()
+            ),
+            "candidate": candidate.to_dict(),
+        },
+        base.with_suffix(".pt"),
+    )
+
+
+def _append_jsonl(path: Path | None, row: dict) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as file:
+        file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _save_checkpoint(candidate: Candidate, checkpoint_dir: Path | None) -> None:
+    if checkpoint_dir is None:
+        return
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    safe_stage = candidate.stage.replace(":", "_").replace("/", "_")
+    iteration = candidate.iteration if candidate.iteration is not None else 0
+    torch.save(
+        {
+            "voice": candidate.voice.cpu().to(torch.float32).contiguous(),
+            "params": (
+                None
+                if candidate.params is None
+                else candidate.params.cpu().to(torch.float32).contiguous()
+            ),
+            "candidate": candidate.to_dict(),
+        },
+        checkpoint_dir
+        / f"{safe_stage}_{iteration:06d}_{candidate.candidate_hash[:10]}.pt",
     )
 
 
@@ -122,6 +178,7 @@ def run_baseline_scan(
     objective: VoiceObjective,
     texts: list[str],
     top_k: int,
+    metadata: dict | None = None,
 ) -> BaselineResult:
     voices = [record.tensor for record in corpus.records]
     evals = objective.evaluate_voices(voices, texts)
@@ -133,6 +190,7 @@ def run_baseline_scan(
             eval_result=eval_result,
             params=None,
             iteration=None,
+            metadata=metadata,
         )
         for record, eval_result in zip(corpus.records, evals)
     ]
@@ -187,14 +245,30 @@ class AntitheticNES:
         sigma_final: float,
         learning_rate: float,
         save_every: int,
+        metadata: dict | None = None,
+        history_path: Path | None = None,
+        checkpoint_dir: Path | None = None,
+        candidate_dir: Path | None = None,
+        validation_texts: list[str] | None = None,
+        validation_evaluate: (
+            Callable[[list[torch.Tensor]], list[CandidateEval]] | None
+        ) = None,
     ) -> NESResult:
         params = self._clamp(initial_params.detach().cpu().to(torch.float32), bounds)
         dim = params.numel()
 
+        if history_path is not None and history_path.exists():
+            history_path.unlink()
+
         current_voice = decode(params)
         current_eval = evaluate([current_voice], [params])[0]
         current_candidate = make_candidate(
-            stage, current_voice, current_eval, params=params, iteration=0
+            stage,
+            current_voice,
+            current_eval,
+            params=params,
+            iteration=0,
+            metadata=metadata,
         )
 
         best_candidate = current_candidate
@@ -224,7 +298,12 @@ class AntitheticNES:
 
             for p, voice, eval_result in zip(param_list, voices, evals):
                 candidate = make_candidate(
-                    stage, voice, eval_result, params=p, iteration=iteration
+                    stage,
+                    voice,
+                    eval_result,
+                    params=p,
+                    iteration=iteration,
+                    metadata=metadata,
                 )
                 if candidate.eval.total_loss < best_candidate.eval.total_loss:
                     best_candidate = candidate
@@ -259,7 +338,20 @@ class AntitheticNES:
                 "learning_rate": learning_rate,
                 "best_candidate_hash": best_candidate.candidate_hash,
             }
+
+            if (
+                validation_texts
+                and validation_evaluate is not None
+                and self.config.validate_every > 0
+                and iteration % self.config.validate_every == 0
+            ):
+                validation_eval = validation_evaluate([best_candidate.voice])[0]
+                row["validation_loss"] = validation_eval.total_loss
+                row["validation_similarity"] = validation_eval.mean_similarity
+
             history.append(row)
+            _append_jsonl(history_path, row)
+
             iterator.set_postfix(
                 {
                     "best": f"{best_candidate.eval.total_loss:.5f}",
@@ -276,18 +368,31 @@ class AntitheticNES:
                     checkpoint_eval,
                     params=params,
                     iteration=iteration,
+                    metadata=metadata,
                 )
                 checkpoint_candidates.append(checkpoint)
+                _save_checkpoint(checkpoint, checkpoint_dir)
+                if candidate_dir is not None:
+                    save_candidate_artifacts(checkpoint, candidate_dir)
                 if checkpoint.eval.total_loss < best_candidate.eval.total_loss:
                     best_candidate = checkpoint
 
         final_voice = decode(params)
         final_eval = evaluate([final_voice], [params])[0]
         final_candidate = make_candidate(
-            stage, final_voice, final_eval, params=params, iteration=iterations
+            stage,
+            final_voice,
+            final_eval,
+            params=params,
+            iteration=iterations,
+            metadata=metadata,
         )
         if final_candidate.eval.total_loss < best_candidate.eval.total_loss:
             best_candidate = final_candidate
+
+        if candidate_dir is not None:
+            save_candidate_artifacts(best_candidate, candidate_dir)
+            save_candidate_artifacts(final_candidate, candidate_dir)
 
         return NESResult(
             best_params=best_candidate.params.clone(),
@@ -306,6 +411,11 @@ def run_blend_search(
     objective: VoiceObjective,
     texts: list[str],
     config: SearchConfig,
+    metadata: dict | None = None,
+    history_path: Path | None = None,
+    checkpoint_dir: Path | None = None,
+    candidate_dir: Path | None = None,
+    validation_texts: list[str] | None = None,
 ) -> BlendResult:
     if not top_candidates:
         raise ValueError("Blend search requires at least one baseline candidate")
@@ -313,16 +423,16 @@ def run_blend_search(
     voices = [candidate.voice for candidate in top_candidates]
     logits = torch.full((len(voices),), -4.0, dtype=torch.float32)
     logits[0] = 4.0
-
     nes = AntitheticNES(config)
 
     def decode(params: torch.Tensor) -> torch.Tensor:
         return convex_blend(params, voices)
 
-    def evaluate(
-        candidate_voices: list[torch.Tensor], params_list: list[torch.Tensor]
-    ) -> list[CandidateEval]:
+    def evaluate(candidate_voices, params_list):
         return objective.evaluate_voices(candidate_voices, texts)
+
+    def validation_evaluate(candidate_voices):
+        return objective.evaluate_voices(candidate_voices, validation_texts or texts)
 
     result = nes.run(
         initial_params=logits,
@@ -336,6 +446,12 @@ def run_blend_search(
         sigma_final=config.blend_sigma_final,
         learning_rate=config.blend_learning_rate,
         save_every=config.save_every,
+        metadata=metadata,
+        history_path=history_path,
+        checkpoint_dir=checkpoint_dir,
+        candidate_dir=candidate_dir,
+        validation_texts=validation_texts,
+        validation_evaluate=validation_evaluate,
     )
 
     return BlendResult(
@@ -346,24 +462,30 @@ def run_blend_search(
 
 
 def run_latent_search(
-    manifold: VoiceManifold,
+    manifold,
     initial_z: torch.Tensor,
     objective: VoiceObjective,
     texts: list[str],
     config: SearchConfig,
+    metadata: dict | None = None,
+    history_path: Path | None = None,
+    checkpoint_dir: Path | None = None,
+    candidate_dir: Path | None = None,
+    validation_texts: list[str] | None = None,
 ) -> LatentResult:
     nes = AntitheticNES(config)
 
     def decode(params: torch.Tensor) -> torch.Tensor:
         return manifold.decode(params, clamp=True)
 
-    def evaluate(
-        candidate_voices: list[torch.Tensor], params_list: list[torch.Tensor]
-    ) -> list[CandidateEval]:
+    def evaluate(candidate_voices, params_list):
         infos = [
             LatentInfo(z=manifold.clamp_z(p), manifold=manifold) for p in params_list
         ]
         return objective.evaluate_voices(candidate_voices, texts, latent_info=infos)
+
+    def validation_evaluate(candidate_voices):
+        return objective.evaluate_voices(candidate_voices, validation_texts or texts)
 
     result = nes.run(
         initial_params=manifold.clamp_z(initial_z),
@@ -377,6 +499,12 @@ def run_latent_search(
         sigma_final=config.latent_sigma_final,
         learning_rate=config.latent_learning_rate,
         save_every=config.save_every,
+        metadata=metadata,
+        history_path=history_path,
+        checkpoint_dir=checkpoint_dir,
+        candidate_dir=candidate_dir,
+        validation_texts=validation_texts,
+        validation_evaluate=validation_evaluate,
     )
 
     return LatentResult(
@@ -391,6 +519,7 @@ def validate_candidates(
     candidates: list[Candidate],
     objective: VoiceObjective,
     texts: list[str],
+    metadata: dict | None = None,
 ) -> ValidationResult:
     if not candidates:
         raise ValueError("No candidates provided for validation")
@@ -405,6 +534,7 @@ def validate_candidates(
             eval_result=eval_result,
             params=candidate.params,
             iteration=candidate.iteration,
+            metadata=metadata or candidate.metadata,
         )
         for candidate, eval_result in zip(candidates, evals)
     ]
