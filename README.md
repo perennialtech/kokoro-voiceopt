@@ -18,7 +18,6 @@ kokoro-voiceopt prepare \
 
 kokoro-voiceopt check   --config config.yaml --project-root .
 kokoro-voiceopt profile --config config.yaml --project-root . --force
-kokoro-voiceopt doctor  --config config.yaml --project-root .
 kokoro-voiceopt optimize --config config.yaml --project-root .
 kokoro-voiceopt export  --config config.yaml --project-root . --candidate best
 kokoro-voiceopt preview --config config.yaml --project-root .
@@ -67,7 +66,7 @@ Use spoken-form transcript text.
 
 ## Run layout
 
-A run is self-describing on disk. Artifact metadata and cache fingerprints are stored beside artifact data.
+A run is self-describing on disk. The expensive/stable artifacts are the prepared target data, target profile, and prepared voice corpus. Optimization uses a simplified single-writer layout.
 
 ```text
 runs/<id>/
@@ -82,7 +81,6 @@ runs/<id>/
       rejected.jsonl
     report.json
     text_plan.json
-    text_plan.meta.json
 
   profile/
     target_profile.pt
@@ -92,46 +90,27 @@ runs/<id>/
     corpus.pt
     corpus_manifest.json
 
-  manifold/
-    manifold.pt
-    manifold_report.json
-
   optimize/
-    stages/
-      baseline.json
-      blend_history.jsonl
-      latent_history.jsonl
-      validation.json
-    checkpoints/
-      blend_000010_<candidate-id>.pt
-      latent_000020_<candidate-id>.pt
+    run.json
+    history.jsonl
+    candidates.jsonl
     voices/
       <voice_hash>.pt
-    evaluations/
-      <candidate_id>.json
-    candidates/
-      <candidate_id>.json
-      <candidate_id>.pt
-    run_info.json
 
   export/
     voice.pt
     voice_meta.json
-    voice_best.pt
-    voice_final.pt
-    voice_best_optimization.pt
-    voice_best_meta.json
-    voice_final_meta.json
-    voice_best_optimization_meta.json
 
   preview/
     preview_00.wav
     preview_00.json
 ```
 
+`optimize/voices/<voice_hash>.pt` stores each retained unique optimized voice tensor once. `optimize/candidates.jsonl` stores retained baseline, blend, latent, checkpoint, final, and validation candidate records. `optimize/history.jsonl` stores per-iteration convergence summaries. `optimize/run.json` stores run fingerprints, exact optimization and validation texts, selected candidate hashes, selected voice hashes, and summary metrics.
+
 ## Artifact metadata
 
-Artifacts use a common metadata schema:
+Only the prepared corpus and target speaker profile use stale-artifact metadata. They use a common metadata schema:
 
 ```json
 {
@@ -139,8 +118,8 @@ Artifacts use a common metadata schema:
   "artifact": "target_profile",
   "fingerprint": {
     "target_manifest_sha256": "...",
-    "audio_config": "...",
-    "speaker_encoder_config": "..."
+    "audio_config_sha256": "...",
+    "speaker_encoder_config_sha256": "..."
   },
   "data_path": "target_profile.pt",
   "data_sha256": "...",
@@ -149,7 +128,9 @@ Artifacts use a common metadata schema:
 }
 ```
 
-If an artifact exists but its fingerprint no longer matches the current config/input files, the command raises a stale-artifact error or rebuilds when the stage owns the artifact.
+If one of these artifacts exists but its fingerprint no longer matches the current config/input files, the command raises a stale-artifact error or rebuilds when the stage owns the artifact.
+
+`data/text_plan.json` is a cheap deterministic convenience file and is regenerated from the current prepared manifest/config at command time.
 
 ## Prepared target manifest
 
@@ -230,20 +211,32 @@ Optimization never downloads voicepacks. It loads only the prepared corpus artif
 
 ## Optimization artifact model
 
-Voice tensor persistence is separated from stage/evaluation records:
+Optimization writes only:
 
-- `voice_hash` identifies voice tensor content.
-- `candidate_id` identifies a stage/evaluation record for a voice.
-- The same `voice_hash` can have multiple candidate/evaluation records, for example baseline and validation.
+```text
+optimize/
+  run.json
+  history.jsonl
+  candidates.jsonl
+  voices/
+    <voice_hash>.pt
+```
 
-Candidate metadata includes:
+Candidate records include:
 
-- text-plan hash,
-- optimization text hash,
-- validation text hash,
-- objective config hash,
-- search config hash,
-- corpus hash,
+- role, such as `baseline_best`, `blend_best`, `latent_checkpoint`, `latent_final`, or `validation_best`;
+- stage;
+- iteration;
+- voice hash;
+- inline blend/latent params when present;
+- evaluation set, either `optimization` or `validation`;
+- evaluation terms;
+- text-plan hash;
+- optimization text hash;
+- validation text hash;
+- objective config hash;
+- search config hash;
+- corpus hash;
 - target profile hash.
 
 Validation explicitly records whether search priors/bounds were included. By default final validation excludes latent prior/bound penalties and evaluates only the validation objective.
@@ -259,4 +252,14 @@ kokoro-voiceopt export --config config.yaml --candidate best_optimization
 kokoro-voiceopt export --config config.yaml --candidate <voice_hash>
 ```
 
-Preview synthesizes validation texts from `data/text_plan.json` using an exported voice.
+Every export selector writes:
+
+```text
+export/
+  voice.pt
+  voice_meta.json
+```
+
+`voice_meta.json` includes the exact optimization and validation texts used for the selected optimization run.
+
+Preview reads validation texts from `export/voice_meta.json` first. If no exported metadata is available, it rebuilds the deterministic text plan from the current prepared manifest/config.

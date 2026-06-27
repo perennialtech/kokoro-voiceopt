@@ -6,8 +6,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from .artifacts import (ArtifactSpec, load_artifact, require_current,
+                        save_artifact, stale_reasons)
 from .audio import load_wave
-from .serde import fingerprint, read_jsonl, sha256_file
+from .serde import fingerprint, load_pt, read_jsonl, save_pt, sha256_file
 
 
 @dataclass
@@ -41,19 +43,19 @@ def profile_fingerprint(ctx, rows: list[dict]) -> dict[str, Any]:
         "target_manifest_sha256": sha256_file(ctx.paths.data("manifests/target.jsonl")),
         "segment_ids": [row["id"] for row in rows],
         "segment_audio_sha256": [row["audio_sha256"] for row in rows],
-        "audio_config_sha256": fingerprint(ctx.audio),
-        "speaker_encoder_config_sha256": fingerprint(ctx.speaker_encoder),
-        "speaker_model_name": ctx.speaker_encoder.model_name,
-        "target_id": ctx.target.id,
-        "lang_code": ctx.target.lang_code,
+        "audio_config_sha256": fingerprint(ctx.cfg.audio),
+        "speaker_encoder_config_sha256": fingerprint(ctx.cfg.speaker_encoder),
+        "speaker_model_name": ctx.cfg.speaker_encoder.model_name,
+        "target_id": ctx.cfg.target.id,
+        "lang_code": ctx.cfg.target.lang_code,
     }
 
 
-def profile_artifact(ctx, rows: list[dict]):
-    return ctx.artifacts.spec(
-        "target_profile",
-        data=ctx.paths.profile("target_profile.pt"),
-        meta=ctx.paths.profile("target_profile.json"),
+def profile_artifact(ctx, rows: list[dict]) -> ArtifactSpec:
+    return ArtifactSpec(
+        name="target_profile",
+        data_path=ctx.paths.profile("target_profile.pt"),
+        meta_path=ctx.paths.profile("target_profile.json"),
         fingerprint=profile_fingerprint(ctx, rows),
     )
 
@@ -77,8 +79,8 @@ def load_target_speaker_profile(ctx) -> TargetSpeakerProfile:
     ctx.require_profile()
     rows = read_jsonl(ctx.paths.data("manifests/target.jsonl"))
     artifact = profile_artifact(ctx, rows)
-    metadata = artifact.require_current()
-    return _profile_from_payload(artifact.load_pt(), metadata)
+    metadata = require_current(artifact)
+    return _profile_from_payload(load_artifact(artifact, load_pt), metadata)
 
 
 def build_target_speaker_profile(
@@ -96,10 +98,10 @@ def build_target_speaker_profile(
     artifact = profile_artifact(ctx, rows)
 
     if artifact.data_path.exists() and artifact.meta_path.exists():
-        if artifact.is_current() and not force:
+        if not stale_reasons(artifact) and not force:
             print(f"Target profile cache is current: {artifact.data_path}")
-            metadata = artifact.metadata()
-            return _profile_from_payload(artifact.load_pt(), metadata)
+            metadata = require_current(artifact)
+            return _profile_from_payload(load_artifact(artifact, load_pt), metadata)
         if not force:
             raise SystemExit(
                 "Target profile exists but metadata does not match; use --force to rebuild"
@@ -135,14 +137,14 @@ def build_target_speaker_profile(
         "segment_durations": durations,
         "segment_ids": [row["id"] for row in rows],
         "segment_audio_sha256": [row["audio_sha256"] for row in rows],
-        "source_sample_rate": ctx.audio.target_sample_rate,
+        "source_sample_rate": ctx.cfg.audio.target_sample_rate,
         "total_speech_seconds": total_speech,
         "total_audio_seconds": total_speech,
         "speech_rate_chars_per_second": float(speech_rate),
     }
 
     temp_profile = _profile_from_payload(payload, {})
-    metadata = artifact.save_pt(payload, extra=temp_profile.summary())
+    metadata = save_artifact(artifact, payload, save_pt, extra=temp_profile.summary())
     profile = _profile_from_payload(payload, metadata)
 
     print(f"Wrote target profile: {artifact.data_path}")

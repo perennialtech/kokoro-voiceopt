@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -22,24 +23,18 @@ class LatentInfo:
 
 
 @dataclass
-class CandidateEval:
+class EvalResult:
     total_loss: float
-    speaker_loss: float
-    prior_loss: float
-    bound_loss: float
-    audio_quality_loss: float
     mean_similarity: float
+    terms: dict[str, float]
     include_latent_penalties: bool
-    per_text: list[dict]
+    per_text: list[dict[str, Any]]
 
     def to_dict(self) -> dict:
         return {
             "total_loss": self.total_loss,
-            "speaker_loss": self.speaker_loss,
-            "prior_loss": self.prior_loss,
-            "bound_loss": self.bound_loss,
-            "audio_quality_loss": self.audio_quality_loss,
             "mean_similarity": self.mean_similarity,
+            "terms": self.terms,
             "include_latent_penalties": self.include_latent_penalties,
             "per_text": self.per_text,
         }
@@ -71,7 +66,7 @@ class VoiceObjective:
         latent_info: list[LatentInfo | None] | None = None,
         *,
         include_latent_penalties: bool = True,
-    ) -> list[CandidateEval]:
+    ) -> list[EvalResult]:
         if not voices:
             return []
         if not texts:
@@ -138,7 +133,7 @@ class VoiceObjective:
 
         target = self.target_profile.embedding.cpu()
 
-        results: list[CandidateEval] = []
+        results: list[EvalResult] = []
         for voice_idx in range(len(voices)):
             per_text: list[dict] = []
             speaker_losses: list[float] = []
@@ -278,13 +273,19 @@ class VoiceObjective:
             )
 
             results.append(
-                CandidateEval(
+                EvalResult(
                     total_loss=float(total_loss),
-                    speaker_loss=float(speaker_loss),
-                    prior_loss=float(prior_loss),
-                    bound_loss=float(bound_loss),
-                    audio_quality_loss=float(audio_quality_loss),
                     mean_similarity=float(mean_similarity),
+                    terms={
+                        "speaker": float(speaker_loss),
+                        "prior": float(prior_loss),
+                        "bound": float(bound_loss),
+                        "audio_quality": float(audio_quality_loss),
+                        "silence": float(silence_loss),
+                        "clipping": float(clipping_loss),
+                        "duration": float(duration_loss),
+                        "invalid": float(invalid_loss),
+                    },
                     include_latent_penalties=include_latent_penalties,
                     per_text=per_text,
                 )

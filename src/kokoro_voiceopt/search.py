@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Callable
 
 import torch
 from tqdm import tqdm
 
-from .config import PathLayout, SearchConfig
+from .config import SearchConfig
 from .corpus import VoiceCorpus
-from .objective import CandidateEval, LatentInfo, VoiceObjective
-from .serde import fingerprint, save_pt, sha256_tensor, write_json
-from .voice import as_voice_2d, save_voice, voice_hash
+from .objective import EvalResult, LatentInfo, VoiceObjective
+from .serde import fingerprint, sha256_tensor
+from .voice import as_voice_2d, voice_hash
 
 
 @dataclass
@@ -21,7 +19,7 @@ class Candidate:
     stage: str
     params: torch.Tensor | None
     voice: torch.Tensor
-    eval: CandidateEval
+    eval: EvalResult
     iteration: int | None
     created_at: str
     voice_hash: str
@@ -35,6 +33,11 @@ class Candidate:
             "created_at": self.created_at,
             "voice_hash": self.voice_hash,
             "candidate_id": self.candidate_id,
+            "params": (
+                self.params.detach().cpu().to(torch.float32).tolist()
+                if self.params is not None
+                else None
+            ),
             "params_shape": (
                 list(self.params.shape) if self.params is not None else None
             ),
@@ -70,7 +73,7 @@ def params_hash(params: torch.Tensor | None) -> str | None:
 def make_candidate(
     stage: str,
     voice: torch.Tensor,
-    eval_result: CandidateEval,
+    eval_result: EvalResult,
     params: torch.Tensor | None = None,
     iteration: int | None = None,
     metadata: dict | None = None,
@@ -102,84 +105,6 @@ def make_candidate(
         voice_hash=vhash,
         candidate_id=candidate_id,
         metadata=metadata,
-    )
-
-
-def save_candidate_artifacts(candidate: Candidate, paths: PathLayout) -> None:
-    voices_dir = paths.optimize("voices")
-    evaluations_dir = paths.optimize("evaluations")
-    candidates_dir = paths.optimize("candidates")
-    params_dir = paths.optimize("params")
-
-    voices_dir.mkdir(parents=True, exist_ok=True)
-    evaluations_dir.mkdir(parents=True, exist_ok=True)
-    candidates_dir.mkdir(parents=True, exist_ok=True)
-    params_dir.mkdir(parents=True, exist_ok=True)
-
-    voice_path = voices_dir / f"{candidate.voice_hash}.pt"
-    if not voice_path.exists():
-        save_voice(voice_path, candidate.voice)
-
-    if candidate.params is not None:
-        save_pt(params_dir / f"{candidate.candidate_id}.pt", candidate.params)
-
-    write_json(
-        evaluations_dir / f"{candidate.candidate_id}.json",
-        {
-            "candidate_id": candidate.candidate_id,
-            "voice_hash": candidate.voice_hash,
-            "stage": candidate.stage,
-            "iteration": candidate.iteration,
-            "metadata": candidate.metadata,
-            "eval": candidate.eval.to_dict(),
-        },
-    )
-    write_json(candidates_dir / f"{candidate.candidate_id}.json", candidate.to_dict())
-    save_pt(
-        candidates_dir / f"{candidate.candidate_id}.pt",
-        {
-            "voice_hash": candidate.voice_hash,
-            "candidate_id": candidate.candidate_id,
-            "voice": candidate.voice.cpu().to(torch.float32).contiguous(),
-            "params": (
-                None
-                if candidate.params is None
-                else candidate.params.cpu().to(torch.float32).contiguous()
-            ),
-            "candidate": candidate.to_dict(),
-        },
-    )
-
-
-def _append_jsonl(path: Path | None, row: dict) -> None:
-    if path is None:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as file:
-        file.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def _save_checkpoint(candidate: Candidate, paths: PathLayout | None) -> None:
-    if paths is None:
-        return
-    checkpoint_dir = paths.optimize("checkpoints")
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    safe_stage = candidate.stage.replace(":", "_").replace("/", "_")
-    iteration = candidate.iteration if candidate.iteration is not None else 0
-    save_pt(
-        checkpoint_dir
-        / f"{safe_stage}_{iteration:06d}_{candidate.candidate_id[:10]}.pt",
-        {
-            "voice_hash": candidate.voice_hash,
-            "candidate_id": candidate.candidate_id,
-            "voice": candidate.voice.cpu().to(torch.float32).contiguous(),
-            "params": (
-                None
-                if candidate.params is None
-                else candidate.params.cpu().to(torch.float32).contiguous()
-            ),
-            "candidate": candidate.to_dict(),
-        },
     )
 
 
@@ -254,9 +179,7 @@ class AntitheticNES:
         self,
         initial_params: torch.Tensor,
         decode: Callable[[torch.Tensor], torch.Tensor],
-        evaluate: Callable[
-            [list[torch.Tensor], list[torch.Tensor]], list[CandidateEval]
-        ],
+        evaluate: Callable[[list[torch.Tensor], list[torch.Tensor]], list[EvalResult]],
         stage: str,
         bounds: tuple[float, float] | None,
         iterations: int,
@@ -264,19 +187,11 @@ class AntitheticNES:
         sigma_initial: float,
         sigma_final: float,
         learning_rate: float,
-        save_every: int,
+        keep_every: int,
         metadata: dict | None = None,
-        history_path: Path | None = None,
-        paths: PathLayout | None = None,
-        validation_evaluate: (
-            Callable[[list[torch.Tensor]], list[CandidateEval]] | None
-        ) = None,
     ) -> SearchResult:
         params = self._clamp(initial_params.detach().cpu().to(torch.float32), bounds)
         dim = params.numel()
-
-        if history_path is not None and history_path.exists():
-            history_path.unlink()
 
         current_voice = decode(params)
         current_eval = evaluate([current_voice], [params])[0]
@@ -359,21 +274,7 @@ class AntitheticNES:
                 "best_candidate_id": best_candidate.candidate_id,
                 "best_voice_hash": best_candidate.voice_hash,
             }
-
-            if (
-                validation_evaluate is not None
-                and self.config.validate_every > 0
-                and iteration % self.config.validate_every == 0
-            ):
-                validation_eval = validation_evaluate([best_candidate.voice])[0]
-                row["validation_loss"] = validation_eval.total_loss
-                row["validation_similarity"] = validation_eval.mean_similarity
-                row["validation_includes_search_penalties"] = (
-                    validation_eval.include_latent_penalties
-                )
-
             history.append(row)
-            _append_jsonl(history_path, row)
 
             iterator.set_postfix(
                 {
@@ -382,7 +283,7 @@ class AntitheticNES:
                 }
             )
 
-            if save_every > 0 and iteration % save_every == 0:
+            if keep_every > 0 and iteration % keep_every == 0:
                 checkpoint_voice = decode(params)
                 checkpoint_eval = evaluate([checkpoint_voice], [params])[0]
                 checkpoint = make_candidate(
@@ -394,9 +295,6 @@ class AntitheticNES:
                     metadata=metadata,
                 )
                 checkpoint_candidates.append(checkpoint)
-                _save_checkpoint(checkpoint, paths)
-                if paths is not None:
-                    save_candidate_artifacts(checkpoint, paths)
                 if checkpoint.eval.total_loss < best_candidate.eval.total_loss:
                     best_candidate = checkpoint
 
@@ -412,10 +310,6 @@ class AntitheticNES:
         )
         if final_candidate.eval.total_loss < best_candidate.eval.total_loss:
             best_candidate = final_candidate
-
-        if paths is not None:
-            save_candidate_artifacts(best_candidate, paths)
-            save_candidate_artifacts(final_candidate, paths)
 
         candidates = [best_candidate, final_candidate, *checkpoint_candidates]
         unique: dict[str, Candidate] = {
@@ -439,9 +333,6 @@ def run_blend_stage(
     texts: list[str],
     config: SearchConfig,
     metadata: dict | None = None,
-    history_path: Path | None = None,
-    paths: PathLayout | None = None,
-    validation_texts: list[str] | None = None,
 ) -> SearchResult:
     if not top_candidates:
         raise ValueError("Blend search requires at least one baseline candidate")
@@ -461,13 +352,6 @@ def run_blend_stage(
             include_latent_penalties=False,
         )
 
-    def validation_evaluate(candidate_voices):
-        return objective.evaluate_voices(
-            candidate_voices,
-            validation_texts or texts,
-            include_latent_penalties=False,
-        )
-
     return nes.run(
         initial_params=logits,
         decode=decode,
@@ -479,11 +363,8 @@ def run_blend_stage(
         sigma_initial=config.blend_sigma_initial,
         sigma_final=config.blend_sigma_final,
         learning_rate=config.blend_learning_rate,
-        save_every=config.save_every,
+        keep_every=config.keep_every,
         metadata=metadata,
-        history_path=history_path,
-        paths=paths,
-        validation_evaluate=validation_evaluate if validation_texts else None,
     )
 
 
@@ -494,9 +375,6 @@ def run_latent_stage(
     texts: list[str],
     config: SearchConfig,
     metadata: dict | None = None,
-    history_path: Path | None = None,
-    paths: PathLayout | None = None,
-    validation_texts: list[str] | None = None,
 ) -> SearchResult:
     nes = AntitheticNES(config)
 
@@ -515,13 +393,6 @@ def run_latent_stage(
             include_latent_penalties=True,
         )
 
-    def validation_evaluate(candidate_voices):
-        return objective.evaluate_voices(
-            candidate_voices,
-            validation_texts or texts,
-            include_latent_penalties=False,
-        )
-
     return nes.run(
         initial_params=manifold.clamp_z(initial_z),
         decode=decode,
@@ -533,11 +404,8 @@ def run_latent_stage(
         sigma_initial=config.latent_sigma_initial,
         sigma_final=config.latent_sigma_final,
         learning_rate=config.latent_learning_rate,
-        save_every=config.save_every,
+        keep_every=config.keep_every,
         metadata=metadata,
-        history_path=history_path,
-        paths=paths,
-        validation_evaluate=validation_evaluate if validation_texts else None,
     )
 
 

@@ -11,51 +11,17 @@ import torchaudio
 from .config import AudioConfig, DataConfig
 
 
-class AudioError(Exception):
-    reason = "audio_error"
-
-
-class AudioDecodeError(AudioError):
-    reason = "audio_decode_failed"
-
-
-class TimestampError(AudioError):
-    reason = "bad_timestamp"
-
-
-class EmptyAudioError(AudioError):
-    reason = "empty_audio"
-
-
-class SilenceError(AudioError):
-    reason = "all_silence"
-
-
-class ClippingError(AudioError):
-    reason = "clipping"
-
-    def __init__(self, metrics: dict[str, Any]):
-        super().__init__("clipping")
-        self.metrics = metrics
-
-
-class DurationRejectionError(AudioError):
-    def __init__(self, reason: str, metrics: dict[str, Any]):
-        super().__init__(reason)
+class ClipReject(Exception):
+    def __init__(
+        self,
+        reason: str,
+        detail: str | None = None,
+        metrics: dict[str, Any] | None = None,
+    ):
+        super().__init__(detail or reason)
         self.reason = reason
-        self.metrics = metrics
-
-
-class HardEndError(AudioError):
-    reason = "hard_end"
-
-    def __init__(self, metrics: dict[str, Any]):
-        super().__init__("hard_end")
-        self.metrics = metrics
-
-
-class AudioSaveError(AudioError):
-    reason = "save_failed"
+        self.detail = detail
+        self.metrics = dict(metrics or {})
 
 
 @dataclass(frozen=True)
@@ -121,30 +87,38 @@ def load_wave(path: str | Path) -> Wave:
         if waveform.ndim == 2:
             waveform = waveform.mean(dim=1)
         elif waveform.ndim != 1:
-            raise AudioDecodeError(f"Unsupported audio shape: {tuple(waveform.shape)}")
+            raise ClipReject(
+                "audio_decode_failed",
+                detail=f"Unsupported audio shape: {tuple(waveform.shape)}",
+            )
         return Wave(waveform.to(torch.float32).contiguous(), int(sr))
-    except AudioDecodeError:
+    except ClipReject:
         raise
     except Exception as exc:
-        raise AudioDecodeError(str(exc)) from exc
+        raise ClipReject("audio_decode_failed", detail=str(exc)) from exc
 
 
 def slice_wave(wave: Wave, start_s, end_s) -> tuple[Wave, float | None, float | None]:
     if start_s is None and end_s is None:
         return wave, None, None
     if start_s is None or end_s is None:
-        raise TimestampError("start_s and end_s must be provided together")
+        raise ClipReject(
+            "bad_timestamp", detail="start_s and end_s must be provided together"
+        )
 
     try:
         start = float(start_s)
         end = float(end_s)
     except Exception as exc:
-        raise TimestampError(
-            f"timestamps must be numeric: start_s={start_s}, end_s={end_s}"
+        raise ClipReject(
+            "bad_timestamp",
+            detail=f"timestamps must be numeric: start_s={start_s}, end_s={end_s}",
         ) from exc
 
     if start < 0 or end <= start:
-        raise TimestampError(f"bad timestamp range: start_s={start}, end_s={end}")
+        raise ClipReject(
+            "bad_timestamp", detail=f"bad timestamp range: start_s={start}, end_s={end}"
+        )
 
     start_sample = int(round(start * wave.sample_rate))
     end_sample = int(round(end * wave.sample_rate))
@@ -153,8 +127,9 @@ def slice_wave(wave: Wave, start_s, end_s) -> tuple[Wave, float | None, float | 
         or end_sample > wave.samples.numel()
         or end_sample <= start_sample
     ):
-        raise TimestampError(
-            f"timestamp range outside audio: start_s={start}, end_s={end}"
+        raise ClipReject(
+            "bad_timestamp",
+            detail=f"timestamp range outside audio: start_s={start}, end_s={end}",
         )
 
     return (
@@ -210,7 +185,7 @@ def trim_wave(
     mask = samples.abs() > float(threshold)
     if not mask.any():
         if raise_on_silence:
-            raise SilenceError("all_silence")
+            raise ClipReject("all_silence")
         return Wave(samples.contiguous(), wave.sample_rate)
 
     active = torch.nonzero(mask, as_tuple=False).flatten()
@@ -268,7 +243,7 @@ def save_wave(path: str | Path, wave: Wave) -> None:
             subtype="PCM_16",
         )
     except Exception as exc:
-        raise AudioSaveError(str(exc)) from exc
+        raise ClipReject("save_failed", detail=str(exc)) from exc
 
 
 def prepare_target_clip(
@@ -282,7 +257,7 @@ def prepare_target_clip(
     wave, source_start_s, source_end_s = slice_wave(wave, start_s, end_s)
 
     if wave.samples.numel() == 0:
-        raise EmptyAudioError("empty_audio")
+        raise ClipReject("empty_audio")
 
     wave = resample_wave(wave, audio_config.target_sample_rate)
 
@@ -304,10 +279,10 @@ def prepare_target_clip(
     pre_fade_dict = pre_fade_metrics.to_manifest()
 
     if pre_fade_metrics.clip_ratio > data_config.max_clip_ratio:
-        raise ClippingError(pre_fade_dict)
+        raise ClipReject("clipping", metrics=pre_fade_dict)
 
     if pre_fade_metrics.hard_end:
-        raise HardEndError(pre_fade_dict)
+        raise ClipReject("hard_end", metrics=pre_fade_dict)
 
     samples = wave.samples
     peak = samples.abs().max().item() if samples.numel() else 0.0
@@ -323,9 +298,9 @@ def prepare_target_clip(
     metrics_dict = metrics.to_manifest()
 
     if metrics.duration_s < data_config.min_duration_s:
-        raise DurationRejectionError("too_short", metrics_dict)
+        raise ClipReject("too_short", metrics=metrics_dict)
     if metrics.duration_s > data_config.max_duration_s:
-        raise DurationRejectionError("too_long", metrics_dict)
+        raise ClipReject("too_long", metrics=metrics_dict)
 
     return PreparedClip(
         wave=wave,

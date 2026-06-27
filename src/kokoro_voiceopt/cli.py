@@ -26,7 +26,7 @@ def main(argv=None) -> None:
     assets_cmd.add_argument("--force", action="store_true")
 
     def run_assets(args) -> None:
-        from .assets import prepare_voice_corpus
+        from .corpus import prepare_voice_corpus
 
         ctx = load(args)
         ctx.write_resolved_config()
@@ -70,23 +70,14 @@ def main(argv=None) -> None:
 
     def run_profile(args) -> None:
         from .profile import build_target_speaker_profile
+        from .services import make_speaker_encoder
 
         ctx = load(args)
         ctx.write_resolved_config()
-        speaker = ctx.services.speaker_encoder()
+        speaker = make_speaker_encoder(ctx)
         build_target_speaker_profile(ctx, speaker, force=args.force)
 
     profile_cmd.set_defaults(func=run_profile)
-
-    doctor_cmd = sub.add_parser("doctor", help="Run preflight checks")
-    add_config(doctor_cmd)
-
-    def run_doctor(args) -> None:
-        from .doctor import doctor
-
-        doctor(load(args))
-
-    doctor_cmd.set_defaults(func=run_doctor)
 
     optimize_cmd = sub.add_parser("optimize", help="Run voice optimization")
     add_config(optimize_cmd)
@@ -97,8 +88,8 @@ def main(argv=None) -> None:
         ctx = load(args)
         ctx.write_resolved_config()
         result = VoiceOptimizationPipeline(ctx).run()
-        print(f"Best voice: {result.best_voice_path}")
-        print(f"Final voice: {result.final_voice_path}")
+        print(f"Exported voice: {result.export_voice_path}")
+        print(f"Exported metadata: {result.export_meta_path}")
         print(f"Best validation loss: {result.best_validation_loss:.6f}")
         print(f"Best optimization loss: {result.best_optimization_loss:.6f}")
         print(f"Selected stage: {result.selected_stage}")

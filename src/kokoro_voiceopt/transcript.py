@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .serde import fingerprint, read_jsonl, sha256_file
+from .serde import fingerprint, read_jsonl, sha256_file, write_json
 
 URL_OR_EMAIL_RE = re.compile(r"https?://\S+|\S+@\S+")
 SPOKEN_FORM_RE = re.compile(r"[\d$€£¥@]")
@@ -168,19 +168,16 @@ def load_validation_texts(path: str | Path) -> list[str]:
 
 
 def text_plan_fingerprint(ctx) -> dict[str, Any]:
+    validation_path = ctx.cfg.text.validation_texts_path
     return {
         "target_manifest_sha256": sha256_file(ctx.paths.data("manifests/target.jsonl")),
-        "text_config_sha256": fingerprint(ctx.text),
+        "text_config_sha256": fingerprint(ctx.cfg.text),
+        "validation_texts_file_sha256": (
+            sha256_file(validation_path)
+            if validation_path is not None and Path(validation_path).exists()
+            else None
+        ),
     }
-
-
-def text_plan_artifact(ctx):
-    return ctx.artifacts.spec(
-        "text_plan",
-        data=ctx.paths.data("text_plan.json"),
-        meta=ctx.paths.data("text_plan.meta.json"),
-        fingerprint=text_plan_fingerprint(ctx),
-    )
 
 
 def build_text_plan(ctx) -> TextPlan:
@@ -192,17 +189,17 @@ def build_text_plan(ctx) -> TextPlan:
 
     optimization_texts = merge_sentences(
         sentences,
-        min_chars=ctx.text.min_text_chars,
-        max_chars=ctx.text.max_text_chars,
-    )[: ctx.text.max_optimization_texts]
+        min_chars=ctx.cfg.text.min_text_chars,
+        max_chars=ctx.cfg.text.max_text_chars,
+    )[: ctx.cfg.text.max_optimization_texts]
 
     if not optimization_texts:
         raise ValueError(
             "No optimization texts could be built from prepared target data"
         )
 
-    if ctx.text.validation_texts_path is not None:
-        validation_source = load_validation_texts(ctx.text.validation_texts_path)
+    if ctx.cfg.text.validation_texts_path is not None:
+        validation_source = load_validation_texts(ctx.cfg.text.validation_texts_path)
     else:
         validation_source = [normalize_text(text) for text in DEFAULT_VALIDATION_TEXTS]
 
@@ -217,9 +214,9 @@ def build_text_plan(ctx) -> TextPlan:
 
     validation_texts = merge_sentences(
         validation_source,
-        min_chars=ctx.text.min_text_chars,
-        max_chars=ctx.text.max_text_chars,
-    )[: ctx.text.max_validation_texts]
+        min_chars=ctx.cfg.text.min_text_chars,
+        max_chars=ctx.cfg.text.max_text_chars,
+    )[: ctx.cfg.text.max_validation_texts]
 
     metadata = text_plan_fingerprint(ctx)
 
@@ -230,28 +227,15 @@ def build_text_plan(ctx) -> TextPlan:
     )
 
 
+def save_text_plan(ctx, plan: TextPlan) -> None:
+    write_json(ctx.paths.data("text_plan.json"), plan.to_dict())
+
+
 def build_and_save_text_plan(ctx) -> TextPlan:
     plan = build_text_plan(ctx)
-    artifact = text_plan_artifact(ctx)
-    artifact.save_json(
-        {
-            "optimization_texts": plan.optimization_texts,
-            "validation_texts": plan.validation_texts,
-        },
-        extra={
-            "optimization_text_count": len(plan.optimization_texts),
-            "validation_text_count": len(plan.validation_texts),
-        },
-    )
+    save_text_plan(ctx, plan)
     return plan
 
 
 def load_text_plan(ctx) -> TextPlan:
-    artifact = text_plan_artifact(ctx)
-    data = artifact.load_json()
-    metadata = artifact.metadata()
-    return TextPlan(
-        optimization_texts=list(data["optimization_texts"]),
-        validation_texts=list(data["validation_texts"]),
-        metadata=metadata,
-    )
+    return build_and_save_text_plan(ctx)

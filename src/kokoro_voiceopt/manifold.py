@@ -168,35 +168,8 @@ def manifold_fingerprint(ctx, corpus) -> dict[str, Any]:
     return {
         "corpus_manifest_sha256": sha256_file(ctx.paths.corpus("corpus_manifest.json")),
         "corpus_sha256": corpus.corpus_sha256,
-        "manifold_config_sha256": fingerprint(ctx.manifold),
+        "manifold_config_sha256": fingerprint(ctx.cfg.manifold),
         "voice_names": corpus.names(),
         "T": corpus.T,
         "D": corpus.D,
     }
-
-
-def manifold_artifact(ctx, corpus):
-    return ctx.artifacts.spec(
-        "voice_manifold",
-        data=ctx.paths.manifold("manifold.pt"),
-        meta=ctx.paths.manifold("manifold_report.json"),
-        fingerprint=manifold_fingerprint(ctx, corpus),
-    )
-
-
-def load_or_build_manifold(ctx, corpus) -> VoiceManifold:
-    artifact = manifold_artifact(ctx, corpus)
-
-    if (
-        artifact.data_path.exists()
-        and artifact.meta_path.exists()
-        and artifact.is_current()
-    ):
-        return VoiceManifold.from_payload(artifact.load_pt(), type(ctx.manifold))
-
-    manifold = VoiceManifold.fit(corpus, ctx.manifold, metadata=artifact.fingerprint)
-
-    if ctx.manifold.save_manifold:
-        artifact.save_pt(manifold.to_payload(), extra=manifold.report())
-
-    return manifold

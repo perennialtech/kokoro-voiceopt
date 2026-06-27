@@ -9,10 +9,7 @@ from typing import Any
 import soundfile as sf
 from tqdm import tqdm
 
-from .audio import (AudioDecodeError, AudioSaveError, ClippingError,
-                    DurationRejectionError, EmptyAudioError, HardEndError,
-                    SilenceError, TimestampError, prepare_target_clip,
-                    save_wave)
+from .audio import ClipReject, prepare_target_clip, save_wave
 from .serde import read_jsonl, sha256_file, write_jsonl
 from .transcript import (build_and_save_text_plan, is_spoken_form,
                          normalize_text, read_transcripts)
@@ -29,10 +26,6 @@ def reject(
     if detail is not None:
         item["reject_detail"] = str(detail)
     rejected.append(item)
-
-
-def _error_metrics(exc: Exception) -> dict[str, Any]:
-    return dict(getattr(exc, "metrics", {}) or {})
 
 
 def prepare_target_dataset(
@@ -63,8 +56,8 @@ def prepare_target_dataset(
             "id": row_id,
             "audio_source": row["audio_source"],
             "text_original": row["text_original"],
-            "speaker": ctx.target.id,
-            "lang_code": ctx.target.lang_code,
+            "speaker": ctx.cfg.target.id,
+            "lang_code": ctx.cfg.target.lang_code,
         }
 
         source = audio_root / row["audio_source"]
@@ -77,7 +70,7 @@ def prepare_target_dataset(
             reject("empty_text", base, rejected)
             continue
 
-        if ctx.data.require_spoken_form and not is_spoken_form(text_normalized):
+        if ctx.cfg.data.require_spoken_form and not is_spoken_form(text_normalized):
             reject(
                 "text_not_spoken_form",
                 {**base, "text_normalized": text_normalized},
@@ -90,29 +83,16 @@ def prepare_target_dataset(
                 source,
                 row["start_s"],
                 row["end_s"],
-                ctx.audio,
-                ctx.data,
+                ctx.cfg.audio,
+                ctx.cfg.data,
             )
-        except TimestampError as exc:
-            reject("bad_timestamp", base, rejected, detail=exc)
-            continue
-        except AudioDecodeError as exc:
-            reject("audio_decode_failed", base, rejected, detail=exc)
-            continue
-        except EmptyAudioError:
-            reject("empty_audio", base, rejected)
-            continue
-        except SilenceError:
-            reject("all_silence", base, rejected)
-            continue
-        except ClippingError as exc:
-            reject("clipping", {**base, **_error_metrics(exc)}, rejected)
-            continue
-        except HardEndError as exc:
-            reject("hard_end", {**base, **_error_metrics(exc)}, rejected)
-            continue
-        except DurationRejectionError as exc:
-            reject(exc.reason, {**base, **_error_metrics(exc)}, rejected)
+        except ClipReject as exc:
+            reject(
+                exc.reason,
+                {**base, **exc.metrics},
+                rejected,
+                detail=exc.detail,
+            )
             continue
 
         metrics = prepared.metrics.to_manifest()
@@ -124,8 +104,8 @@ def prepare_target_dataset(
                 "source_end_s": prepared.source_end_s,
                 "text_original": row["text_original"],
                 "text_normalized": text_normalized,
-                "speaker": ctx.target.id,
-                "lang_code": ctx.target.lang_code,
+                "speaker": ctx.cfg.target.id,
+                "lang_code": ctx.cfg.target.lang_code,
                 "duration_s": round(metrics["duration_s"], 4),
                 "n_chars": len(text_normalized),
                 "peak": metrics["peak"],
@@ -139,12 +119,12 @@ def prepare_target_dataset(
         write_jsonl(ctx.paths.data("manifests/rejected.jsonl"), rejected)
         raise SystemExit("No usable target clips were prepared")
 
-    if len(accepted_pending) > ctx.data.max_target_clips:
+    if len(accepted_pending) > ctx.cfg.data.max_target_clips:
         accepted_pending = sorted(
             accepted_pending,
             key=lambda r: (r["duration_s"], r["id"]),
             reverse=True,
-        )[: ctx.data.max_target_clips]
+        )[: ctx.cfg.data.max_target_clips]
 
     accepted: list[dict[str, Any]] = []
     for item in accepted_pending:
@@ -154,18 +134,19 @@ def prepare_target_dataset(
 
         try:
             save_wave(audio_path, wave)
-        except AudioSaveError as exc:
+        except ClipReject as exc:
             reject(
-                "save_failed",
+                exc.reason,
                 {
                     "id": row_id,
                     "audio_source": item["source_audio"],
                     "text_original": item["text_original"],
-                    "speaker": ctx.target.id,
-                    "lang_code": ctx.target.lang_code,
+                    "speaker": ctx.cfg.target.id,
+                    "lang_code": ctx.cfg.target.lang_code,
+                    **exc.metrics,
                 },
                 rejected,
-                detail=exc,
+                detail=exc.detail,
             )
             continue
 
@@ -193,7 +174,7 @@ def prepare_target_dataset(
         "min_duration_s": min(durations),
         "max_duration_s": max(durations),
         "mean_duration_s": round(sum(durations) / len(durations), 4),
-        "sample_rate": ctx.audio.target_sample_rate,
+        "sample_rate": ctx.cfg.audio.target_sample_rate,
         "reject_reasons": dict(Counter(row["reject_reason"] for row in rejected)),
         "total_chars": sum(int(row["n_chars"]) for row in accepted),
         "unique_source_files": len({row["source_audio"] for row in accepted}),
@@ -231,15 +212,15 @@ def check_target_dataset(ctx) -> None:
             errors.append(f"duplicate id: {row_id}")
         seen_ids.add(row_id)
 
-        if row.get("speaker") != ctx.target.id:
+        if row.get("speaker") != ctx.cfg.target.id:
             errors.append(f"{row_id}: speaker mismatch")
-        if row.get("lang_code") != ctx.target.lang_code:
+        if row.get("lang_code") != ctx.cfg.target.lang_code:
             errors.append(f"{row_id}: lang_code mismatch")
 
         text = str(row.get("text_normalized", "")).strip()
         if not text:
             errors.append(f"{row_id}: empty text_normalized")
-        if ctx.data.require_spoken_form and text and not is_spoken_form(text):
+        if ctx.cfg.data.require_spoken_form and text and not is_spoken_form(text):
             errors.append(f"{row_id}: text_normalized is not spoken-form compatible")
 
         audio = ctx.paths.data(row.get("audio", ""))
@@ -253,9 +234,9 @@ def check_target_dataset(ctx) -> None:
             errors.append(f"{row_id}: audio read failed: {exc}")
             continue
 
-        if info.samplerate != ctx.audio.target_sample_rate:
+        if info.samplerate != ctx.cfg.audio.target_sample_rate:
             errors.append(
-                f"{row_id}: expected {ctx.audio.target_sample_rate} Hz, got {info.samplerate}"
+                f"{row_id}: expected {ctx.cfg.audio.target_sample_rate} Hz, got {info.samplerate}"
             )
         if info.channels != 1:
             errors.append(f"{row_id}: expected mono, got {info.channels} channels")
@@ -269,30 +250,30 @@ def check_target_dataset(ctx) -> None:
         if abs(duration - manifest_duration) > 0.05:
             errors.append(f"{row_id}: duration mismatch")
 
-        if duration < ctx.data.min_duration_s:
+        if duration < ctx.cfg.data.min_duration_s:
             errors.append(f"{row_id}: too short")
-        if duration > ctx.data.max_duration_s:
+        if duration > ctx.cfg.data.max_duration_s:
             errors.append(f"{row_id}: too long")
 
         total_duration += duration
         durations.append(duration)
 
-    if len(rows) < ctx.data.min_target_clips:
+    if len(rows) < ctx.cfg.data.min_target_clips:
         errors.append(
-            f"target clip count {len(rows)} below minimum {ctx.data.min_target_clips}"
+            f"target clip count {len(rows)} below minimum {ctx.cfg.data.min_target_clips}"
         )
-    if total_duration < ctx.data.min_total_duration_s:
+    if total_duration < ctx.cfg.data.min_total_duration_s:
         errors.append(
             f"total duration {total_duration:.2f}s below minimum "
-            f"{ctx.data.min_total_duration_s:.2f}s"
+            f"{ctx.cfg.data.min_total_duration_s:.2f}s"
         )
 
     print(f"Rows: {len(rows):,}")
     print(f"Duration: {total_duration:.2f}s")
     if durations:
         print(f"Duration range: {min(durations):.2f}s - {max(durations):.2f}s")
-    print(f"Speaker: {ctx.target.id}")
-    print(f"Language code: {ctx.target.lang_code}")
+    print(f"Speaker: {ctx.cfg.target.id}")
+    print(f"Language code: {ctx.cfg.target.lang_code}")
     if rejected_manifest.exists():
         print(f"Rejected rows: {len(read_jsonl(rejected_manifest)):,}")
 

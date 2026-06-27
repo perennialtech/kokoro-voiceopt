@@ -57,7 +57,6 @@ manifold:
   variance_coverage: 0.98
   z_soft_bound: 2.5
   z_hard_bound: 4.0
-  save_manifold: true
 
 objective:
   speaker_loss_weight: 1.0
@@ -86,7 +85,6 @@ search:
   adam_beta1: 0.9
   adam_beta2: 0.999
   adam_eps: 1.0e-8
-  save_every: 10
-  validate_every: 20
+  keep_every: 10
 
 device: cuda

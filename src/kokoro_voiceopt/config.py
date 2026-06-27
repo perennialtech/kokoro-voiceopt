@@ -6,7 +6,6 @@ from typing import Any
 
 import yaml
 
-from .artifacts import ArtifactStore
 from .serde import jsonable
 
 SCHEMA_VERSION = 1
@@ -84,7 +83,6 @@ class ManifoldConfig:
     variance_coverage: float = 0.98
     z_soft_bound: float = 2.5
     z_hard_bound: float = 4.0
-    save_manifold: bool = True
 
 
 @dataclass(frozen=True)
@@ -121,8 +119,7 @@ class SearchConfig:
     adam_beta2: float = 0.999
     adam_eps: float = 1e-8
 
-    save_every: int = 10
-    validate_every: int = 20
+    keep_every: int = 10
 
 
 @dataclass(frozen=True)
@@ -139,7 +136,6 @@ class Config:
     objective: ObjectiveConfig
     search: SearchConfig
     device: str
-    raw: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -208,19 +204,16 @@ class PathLayout:
             "data_dir": str(self.data_dir),
             "profile_dir": str(self.profile_dir),
             "corpus_dir": str(self.corpus_dir),
-            "manifold_dir": str(self.manifold_dir),
             "optimize_dir": str(self.optimize_dir),
             "export_dir": str(self.export_dir),
             "preview_dir": str(self.preview_dir),
         }
 
 
-@dataclass
+@dataclass(frozen=True)
 class Context:
-    config: Config
+    cfg: Config
     paths: PathLayout
-    artifacts: ArtifactStore
-    services: Any
     project_root: Path
     config_path: Path
 
@@ -289,7 +282,7 @@ class Context:
             else None
         )
 
-        config = Config(
+        cfg = Config(
             schema_version=SCHEMA_VERSION,
             run=RunConfig(id=run_id, root=run_root),
             target=TargetConfig(**dict(raw["target"])),
@@ -304,7 +297,6 @@ class Context:
             objective=ObjectiveConfig(**dict(raw.get("objective", {}))),
             search=SearchConfig(**dict(raw.get("search", {}))),
             device=str(raw.get("device", "cuda")),
-            raw=raw,
         )
 
         paths = PathLayout(
@@ -312,62 +304,16 @@ class Context:
             corpus_root=assets.prepared_corpus_dir or run_root / "corpus",
         )
 
-        from .services import ServiceFactory
-
-        ctx = cls(
-            config=config,
+        return cls(
+            cfg=cfg,
             paths=paths,
-            artifacts=ArtifactStore(),
-            services=None,
             project_root=project_root_path,
             config_path=config_path_obj,
         )
-        ctx.services = ServiceFactory(ctx)
-        return ctx
 
     @property
     def id(self) -> str:
-        return self.config.run.id
-
-    @property
-    def target(self) -> TargetConfig:
-        return self.config.target
-
-    @property
-    def audio(self) -> AudioConfig:
-        return self.config.audio
-
-    @property
-    def data(self) -> DataConfig:
-        return self.config.data
-
-    @property
-    def speaker_encoder(self) -> SpeakerEncoderConfig:
-        return self.config.speaker_encoder
-
-    @property
-    def assets(self) -> VoiceCorpusConfig:
-        return self.config.assets
-
-    @property
-    def text(self) -> TextConfig:
-        return self.config.text
-
-    @property
-    def manifold(self) -> ManifoldConfig:
-        return self.config.manifold
-
-    @property
-    def objective(self) -> ObjectiveConfig:
-        return self.config.objective
-
-    @property
-    def search(self) -> SearchConfig:
-        return self.config.search
-
-    @property
-    def device(self) -> str:
-        return self.config.device
+        return self.cfg.run.id
 
     def resolve_path(self, path: str | Path) -> Path:
         return resolve_path(self.project_root, path)
@@ -380,34 +326,23 @@ class Context:
             yaml.safe_dump(self.to_dict(), file, sort_keys=False, allow_unicode=True)
 
     def to_dict(self) -> dict[str, Any]:
-        raw = dict(self.config.raw)
-        raw["resolved_paths"] = self.paths.as_dict()
-        raw["resolved_assets"] = {
-            "repo_id": self.assets.repo_id,
-            "voices_dir": (
-                str(self.assets.voices_dir) if self.assets.voices_dir else None
-            ),
-            "prepared_corpus_dir": str(self.paths.corpus_dir),
-            "voice_names": (
-                list(self.assets.voice_names) if self.assets.voice_names else None
-            ),
-            "include_cross_language_voices": self.assets.include_cross_language_voices,
-            "dtype": self.assets.dtype,
+        return {
+            "schema_version": self.cfg.schema_version,
+            "run": jsonable(asdict(self.cfg.run)),
+            "target": jsonable(asdict(self.cfg.target)),
+            "assets": jsonable(asdict(self.cfg.assets)),
+            "audio": jsonable(asdict(self.cfg.audio)),
+            "data": jsonable(asdict(self.cfg.data)),
+            "speaker_encoder": jsonable(asdict(self.cfg.speaker_encoder)),
+            "text": jsonable(asdict(self.cfg.text)),
+            "manifold": jsonable(asdict(self.cfg.manifold)),
+            "objective": jsonable(asdict(self.cfg.objective)),
+            "search": jsonable(asdict(self.cfg.search)),
+            "device": self.cfg.device,
+            "project_root": str(self.project_root),
+            "config_path": str(self.config_path),
+            "resolved_paths": self.paths.as_dict(),
         }
-        raw["resolved_config"] = {
-            "run": jsonable(asdict(self.config.run)),
-            "target": jsonable(asdict(self.target)),
-            "audio": jsonable(asdict(self.audio)),
-            "data": jsonable(asdict(self.data)),
-            "speaker_encoder": jsonable(asdict(self.speaker_encoder)),
-            "assets": jsonable(asdict(self.assets)),
-            "text": jsonable(asdict(self.text)),
-            "manifold": jsonable(asdict(self.manifold)),
-            "objective": jsonable(asdict(self.objective)),
-            "search": jsonable(asdict(self.search)),
-            "device": self.device,
-        }
-        return raw
 
     def require_manifests(self) -> None:
         require_paths(
