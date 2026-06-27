@@ -11,4 +11,5 @@ wheels/
 
 *.wav
 
-trt_artifacts
+runs/
+trt_artifacts/
