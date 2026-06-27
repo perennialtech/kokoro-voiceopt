@@ -1,0 +1,35 @@
+[project]
+name = "kokoro-voiceopt"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "huggingface-hub>=1.21.0",
+    "kokoro>=0.9.4",
+    "misaki[en]>=0.9.4",
+    "numpy>=2.4.6",
+    "silero-vad>=6.2.1",
+    "torch>=2.12.1",
+    "torchaudio>=2.11.0",
+    "tqdm>=4.68.3",
+    "transformers>=5.12.1",
+]
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.9",
+    "black>=26.5.1",
+    "isort>=8.0.1",
+    "pytest>=9.1.1",
+    "ruff>=0.15.20",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchaudio = { index = "pytorch-cu130" }
