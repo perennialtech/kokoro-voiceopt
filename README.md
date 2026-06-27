@@ -7,20 +7,20 @@ It optimizes a Kokoro voicepack against prepared, validated target speaker clips
 ## Command flow
 
 ```bash
-kokoro-voiceopt assets  --config config.yaml --project-root . --force
+uv run kokoro-voiceopt assets  --config config.yaml --project-root . --force
 
-kokoro-voiceopt prepare \
+uv run kokoro-voiceopt prepare \
   --config config.yaml \
   --project-root . \
   --audio-dir raw_audio \
   --transcripts target.jsonl \
   --force
 
-kokoro-voiceopt check   --config config.yaml --project-root .
-kokoro-voiceopt profile --config config.yaml --project-root . --force
-kokoro-voiceopt optimize --config config.yaml --project-root .
-kokoro-voiceopt export  --config config.yaml --project-root . --candidate best
-kokoro-voiceopt preview --config config.yaml --project-root .
+uv run kokoro-voiceopt check   --config config.yaml --project-root .
+uv run kokoro-voiceopt profile --config config.yaml --project-root . --force
+uv run kokoro-voiceopt optimize --config config.yaml --project-root .
+uv run kokoro-voiceopt export  --config config.yaml --project-root . --candidate best
+uv run kokoro-voiceopt preview --config config.yaml --project-root .
 ```
 
 All relative CLI paths are resolved against `--project-root`.
@@ -246,10 +246,10 @@ Validation explicitly records whether search priors/bounds were included. By def
 Export selectors:
 
 ```bash
-kokoro-voiceopt export --config config.yaml --candidate best
-kokoro-voiceopt export --config config.yaml --candidate final
-kokoro-voiceopt export --config config.yaml --candidate best_optimization
-kokoro-voiceopt export --config config.yaml --candidate <voice_hash>
+uv run kokoro-voiceopt export --config config.yaml --candidate best
+uv run kokoro-voiceopt export --config config.yaml --candidate final
+uv run kokoro-voiceopt export --config config.yaml --candidate best_optimization
+uv run kokoro-voiceopt export --config config.yaml --candidate <voice_hash>
 ```
 
 Every export selector writes:
