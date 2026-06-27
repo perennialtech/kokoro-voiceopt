@@ -216,6 +216,30 @@ def corpus_artifact(ctx) -> ArtifactSpec:
 
 
 def prepare_voice_corpus(ctx, force: bool = False) -> dict:
+    names = resolve_voice_names(ctx.cfg.assets, ctx.cfg.target.lang_code)
+    if not names:
+        raise ValueError("No voice names selected for the prepared corpus")
+
+    trt_dir = ctx.cfg.assets.trt_artifact_dir
+    if trt_dir is not None:
+        if trt_dir.exists() and any(trt_dir.iterdir()):
+            if force:
+                shutil.rmtree(trt_dir)
+
+        if not trt_dir.exists() or not any(trt_dir.iterdir()):
+            from kokoro import Profile, compile_artifact
+
+            print(f"Compiling Kokoro TRT artifact to {trt_dir}...")
+            precision = "fp16" if ctx.cfg.assets.dtype == "float16" else "fp32"
+
+            compile_artifact(
+                str(trt_dir),
+                repo_id=ctx.cfg.assets.repo_id,
+                precision=precision,
+                profile=Profile(min_frames=16, opt_frames=256, max_frames=2048),
+                include_voices=[names[0]],
+            )
+
     corpus_dir = ctx.paths.corpus_dir
     if corpus_dir.exists() and any(corpus_dir.iterdir()):
         if not force:
@@ -224,10 +248,6 @@ def prepare_voice_corpus(ctx, force: bool = False) -> dict:
 
     ctx.write_resolved_config()
     corpus_dir.mkdir(parents=True, exist_ok=True)
-
-    names = resolve_voice_names(ctx.cfg.assets, ctx.cfg.target.lang_code)
-    if not names:
-        raise ValueError("No voice names selected for the prepared corpus")
 
     dtype = dtype_from_name(ctx.cfg.assets.dtype)
 
