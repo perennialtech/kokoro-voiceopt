@@ -18,8 +18,7 @@ assets:
   dtype: float32
 
 audio:
-  target_sample_rate: 16000
-  kokoro_sample_rate: 24000
+  target_sample_rate: 24000
   trim_edges: true
   trim_threshold: 0.015
   trim_pad_ms: 120
@@ -36,18 +35,14 @@ data:
   max_target_clips: 999
   max_clip_ratio: 0.0001
   hard_end_threshold: 0.2
-  require_spoken_form: true
   seed: 42
 
 speaker_encoder:
   backend: wavlm_xvector
   model_name: microsoft/wavlm-base-plus-sv
   batch_size: 8
-  normalize_embeddings: true
 
 text:
-  max_optimization_texts: 3
-  max_validation_texts: 6
   min_text_chars: 20
   max_text_chars: 220
   validation_texts_path: null

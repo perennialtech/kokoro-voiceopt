@@ -92,8 +92,7 @@ class WavLMXVectorSpeakerEncoder(SpeakerEncoder):
 
             model_outputs = self.model(**inputs)
             embeddings = model_outputs.embeddings
-            if self.config.normalize_embeddings:
-                embeddings = F.normalize(embeddings, dim=-1)
+            embeddings = F.normalize(embeddings, dim=-1)
 
             outputs.append(embeddings.detach().cpu())
 

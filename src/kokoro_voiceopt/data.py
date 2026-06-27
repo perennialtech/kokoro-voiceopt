@@ -70,7 +70,7 @@ def prepare_target_dataset(
             reject("empty_text", base, rejected)
             continue
 
-        if ctx.cfg.data.require_spoken_form and not is_spoken_form(text_normalized):
+        if not is_spoken_form(text_normalized):
             reject(
                 "text_not_spoken_form",
                 {**base, "text_normalized": text_normalized},
@@ -220,7 +220,7 @@ def check_target_dataset(ctx) -> None:
         text = str(row.get("text_normalized", "")).strip()
         if not text:
             errors.append(f"{row_id}: empty text_normalized")
-        if ctx.cfg.data.require_spoken_form and text and not is_spoken_form(text):
+        if text and not is_spoken_form(text):
             errors.append(f"{row_id}: text_normalized is not spoken-form compatible")
 
         audio = ctx.paths.data(row.get("audio", ""))

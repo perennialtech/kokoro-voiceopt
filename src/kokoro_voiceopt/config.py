@@ -26,7 +26,6 @@ class TargetConfig:
 @dataclass(frozen=True)
 class AudioConfig:
     target_sample_rate: int = 16000
-    kokoro_sample_rate: int = 24000
     trim_edges: bool = True
     trim_threshold: float = 0.015
     trim_pad_ms: int = 120
@@ -45,7 +44,6 @@ class DataConfig:
     max_target_clips: int = 24
     max_clip_ratio: float = 0.0001
     hard_end_threshold: float = 0.2
-    require_spoken_form: bool = True
     seed: int = 42
 
 
@@ -54,7 +52,6 @@ class SpeakerEncoderConfig:
     backend: str = "wavlm_xvector"
     model_name: str = "microsoft/wavlm-base-plus-sv"
     batch_size: int = 16
-    normalize_embeddings: bool = True
 
 
 @dataclass(frozen=True)
@@ -70,8 +67,6 @@ class VoiceCorpusConfig:
 
 @dataclass(frozen=True)
 class TextConfig:
-    max_optimization_texts: int = 3
-    max_validation_texts: int = 6
     min_text_chars: int = 20
     max_text_chars: int = 220
     validation_texts_path: Path | None = None

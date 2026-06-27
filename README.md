@@ -60,7 +60,7 @@ Preparation applies deterministic normalization:
 - bracketed noise-marker removal,
 - whitespace collapse.
 
-When `data.require_spoken_form` is true, rows are rejected if the normalized text contains URLs, email addresses, digits, currency symbols, or raw `@`.
+Rows are rejected if the normalized text contains URLs, email addresses, digits, currency symbols, or raw `@`.
 
 Use spoken-form transcript text.
 

@@ -28,6 +28,6 @@ def make_synthesizer(ctx: Context):
 
     return KokoroSynthesizer(
         make_kokoro_pipeline(ctx),
-        sample_rate=ctx.cfg.audio.kokoro_sample_rate,
+        sample_rate=24000,
         lang_code=ctx.cfg.target.lang_code,
     )

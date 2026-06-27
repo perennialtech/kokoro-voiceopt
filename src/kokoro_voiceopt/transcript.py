@@ -191,7 +191,7 @@ def build_text_plan(ctx) -> TextPlan:
         sentences,
         min_chars=ctx.cfg.text.min_text_chars,
         max_chars=ctx.cfg.text.max_text_chars,
-    )[: ctx.cfg.text.max_optimization_texts]
+    )[:3]
 
     if not optimization_texts:
         raise ValueError(
@@ -216,7 +216,7 @@ def build_text_plan(ctx) -> TextPlan:
         validation_source,
         min_chars=ctx.cfg.text.min_text_chars,
         max_chars=ctx.cfg.text.max_text_chars,
-    )[: ctx.cfg.text.max_validation_texts]
+    )[:6]
 
     metadata = text_plan_fingerprint(ctx)
 
