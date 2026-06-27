@@ -7,7 +7,7 @@ It does **not** train Kokoro, update model weights, or require a differentiable 
 ## Install dependencies
 
 ```bash
-pip install -r requirements-voiceopt.txt
+uv sync
 ```
 
 The default speaker encoder uses:
@@ -23,7 +23,7 @@ Silero VAD is used for target speech segmentation.
 ## CLI usage
 
 ```bash
-python scripts/optimize_voice.py \
+uv run python scripts/optimize_voice.py \
   --target-audio path/to/target.wav \
   --target-transcript "exact words spoken in the target clip" \
   --output-dir runs/my_voice \
@@ -34,7 +34,7 @@ python scripts/optimize_voice.py \
 Important options:
 
 ```bash
-python scripts/optimize_voice.py \
+uv run python scripts/optimize_voice.py \
   --target-audio target.wav \
   --target-transcript "The transcript of the target audio goes here." \
   --output-dir runs/example \
